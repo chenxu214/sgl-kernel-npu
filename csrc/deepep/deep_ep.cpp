@@ -1,17 +1,33 @@
 #include <memory>
 #include <cmath>
+#include <cstring>
+#include <cstdlib>
+#include <algorithm>
+#include <vector>
 #include <pybind11/functional.h>
 
 #include "hccl/hccl.h"
 #include "exception.hpp"
 #include "deep_ep.hpp"
+#include "profiling/adapters/fused_deep_moe_a5/fused_deep_moe_a5_profile_adapter.hpp"
 #include "pytorch_npu_helper.hpp"
 
 namespace deep_ep {
 constexpr int PADDING_SIZE = 1;
 constexpr size_t HCOMM_NAME_LEN = 128;
-constexpr uint32_t NO_SCALES = 0;
-constexpr uint32_t DYNAMIC_SCALES = 2;
+constexpr int64_t NO_SCALES = 0;
+constexpr int64_t DYNAMIC_SCALES = 2;
+constexpr int64_t MXFP8_SCALES = 3;
+constexpr int64_t MXFP4_SCALES = 4;
+constexpr int64_t PER_TOKEN_FP8_SCALES = 5;
+constexpr int64_t FUSED_DEEP_MOE_ACTIVATION_SWIGLU = 0;
+constexpr int64_t FUSED_DEEP_MOE_ACTIVATION_SITU = 1;
+#if !defined(__DAV_C310__)
+constexpr int FUSED_DEEP_MOE_NO_QUANT = 0;
+constexpr int FUSED_DEEP_MOE_INT8_QUANT = 1;
+#endif
+constexpr uint32_t MX_BLOCK_SIZE = 32;
+constexpr uint32_t MXFP4_HALF = 2;
 constexpr int LOCAL_RANK_SIZE = 8;
 constexpr int MAX_BATCH_SIZE = 4096;
 constexpr int EXPERT_DATA_SIZE = 1 + MAX_BATCH_SIZE;  // 4097
@@ -35,12 +51,12 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks);
 
     if (moe_all_to_all_group_name.empty()) {
-        char *ranktable_file = std::getenv("RANK_TABLE_FILE");
-        EP_HOST_ASSERT(ranktable_file != nullptr)
-        ACL_CHECK(aclrtGetDevice(&device_id));
-
         // ep domain
-        HCCL_CHECK(HcclCommInitClusterInfo(ranktable_file, device_id, &ep_comm));
+        HcclRootInfo rootInfo;
+        HcclGetRootInfo(&rootInfo);
+        ACL_CHECK(aclrtGetDevice(&device_id));
+        // 初始化通信域
+        HcclCommInitRootInfo(num_ranks, &rootInfo, device_id, &ep_comm);
     } else {
         EP_HOST_ASSERT(moe_all_to_all_group_name.size() < HCOMM_NAME_LEN);
     }
@@ -67,7 +83,9 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
         long t = std::strtol(tokensEnv, &end, 10);
         EP_HOST_ASSERT(*end == '\0' && t >= MIN_TOKENS_PER_ROUND && t <= MAX_TOKENS_PER_ROUND);
         // 验证乘积限制
-        EP_HOST_ASSERT(r * t <= 131072);
+        EP_HOST_ASSERT_S(r * t <= MAX_TOTAL_TOKENS, "DEEPEP_NORMAL_LONG_SEQ_ROUND (", r,
+                         ") * DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS (", t, ") must not exceed MAX_TOTAL_TOKENS (",
+                         MAX_TOTAL_TOKENS, ").");
         round = static_cast<int>(r);
         per_round_tokens = static_cast<int>(t);
     }
@@ -99,37 +117,32 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts, std:
     EP_HOST_ASSERT(topk_idx.dim() == 2);
     EP_HOST_ASSERT(topk_idx.is_contiguous());
     EP_HOST_ASSERT(num_experts > 0);
-    EP_HOST_ASSERT(topk_idx.size(0) <= round * per_round_tokens);
+    const int num_tokens = topk_idx.size(0);
+    const int num_topk = topk_idx.size(1);
+    EP_HOST_ASSERT_S(num_tokens >= 0 && num_tokens <= static_cast<int>(MAX_TOTAL_TOKENS), "num_tokens (", num_tokens,
+                     ") must be in the range [0, ", MAX_TOTAL_TOKENS, "].");
+    EP_HOST_ASSERT_S(per_round_tokens >= static_cast<int>(MIN_TOKENS_PER_ROUND) &&
+                         per_round_tokens <= static_cast<int>(MAX_TOKENS_PER_ROUND),
+                     "per_round_tokens (", per_round_tokens, ") must be in the range [", MIN_TOKENS_PER_ROUND, ", ",
+                     MAX_TOKENS_PER_ROUND, "].");
+    EP_HOST_ASSERT_S(rank >= 0 && rank < num_ranks, "rank (", rank, ") must be in the range [0, ", num_ranks, ").");
+    const int configured_capacity = round * per_round_tokens;
+    EP_HOST_ASSERT_S(num_tokens <= configured_capacity, "num_tokens (", num_tokens,
+                     ") must not exceed the configured capacity (", configured_capacity, "), calculated as round (",
+                     round, ") * per_round_tokens (", per_round_tokens, ").");
 
-    this->new_topk_idx = topk_idx;
-    // for padding
-    if (topk_idx.size(0) < PADDING_SIZE) {
-        this->is_padding = true;
-        this->padding_cnt = PADDING_SIZE - topk_idx.size(0);
-        std::vector<at::Tensor> topk_blocks;
-        if (topk_idx.size(0) != 0) {
-            topk_blocks.emplace_back(topk_idx);
-        }
-        int topk = static_cast<int>(topk_idx.size(1));
-        for (int i = 0; i < this->padding_cnt; i++) {
-            at::Tensor tmp_topk = torch::arange(0, topk, topk_idx.options()).reshape({1, topk});
-            topk_blocks.emplace_back(tmp_topk);
-        }
-        this->new_topk_idx = torch::cat(topk_blocks, 0);
-    }
-
-    const int num_tokens = new_topk_idx.size(0);
-    const int num_topk = new_topk_idx.size(1);
+    const int64_t actual_rounds = (static_cast<int64_t>(num_tokens) + per_round_tokens - 1) / per_round_tokens;
+    EP_HOST_ASSERT_S(actual_rounds <= static_cast<int>(MAX_ROUNDS), "actual_rounds (", actual_rounds,
+                     ") must not exceed MAX_ROUNDS (", MAX_ROUNDS, ").");
     const int local_ranksize = LOCAL_RANK_SIZE;
     auto server_num = num_ranks / local_ranksize;
-
-    auto device = new_topk_idx.device();
+    auto device = topk_idx.device();
 
     auto num_tokens_per_expert = at::zeros({round, num_experts}, at::dtype(at::kInt).device(device));
     auto num_tokens_per_rank = at::zeros({num_ranks}, at::dtype(at::kInt).device(device));
     auto is_token_in_rank = at::zeros({num_tokens, num_ranks}, at::dtype(at::kInt).device(device));
     const int notify_send_data_size =
-        num_experts * EXPERT_DATA_SIZE + server_num + MAX_BATCH_SIZE * (1 + 2 * server_num + num_experts);
+        num_experts * EXPERT_DATA_SIZE + server_num + MAX_BATCH_SIZE * (1 + 2 * server_num + 2 * num_topk);
     /*
     The notify send data is constructed by 7 parameters and the 7 parameters are ordered as follows:
     1. the number of the tokens that every expert received from this NPU.
@@ -144,13 +157,15 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts, std:
        size:[MAX_BS, serverNum]
     6. The order in which each token is sent to the expert.
        size:[MAX_BS, numTopk]
-    7. The server offset of tokens received by each expert from this NPU.
+    7. The expert that each token is sent to.
+       size:[MAX_BS, numTopk]
+    8. The server offset of tokens received by each expert from this NPU.
        size:[numExpert, MAX_BS]
     */
     auto send_token_idx_small = at::zeros({num_tokens, num_topk}, at::dtype(at::kInt).device(device));
     auto notify_send_data = at::zeros({notify_send_data_size}, at::dtype(at::kInt).device(device));
     int32_t rank_id = static_cast<int>(rank);
-    EXEC_NPU_CMD(aclnnDispatchLayout, new_topk_idx, num_tokens, num_ranks, num_experts, num_topk, local_ranksize,
+    EXEC_NPU_CMD(aclnnDispatchLayout, topk_idx, num_tokens, num_ranks, num_experts, num_topk, local_ranksize,
                  per_round_tokens, rank_id, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank,
                  notify_send_data, send_token_idx_small);
 
@@ -191,16 +206,15 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
                            const std::optional<at::Tensor> &cached_channel_prefix_matrix,
                            const std::optional<at::Tensor> &dispatch_wait_recv_cost_stats, int expert_alignment,
                            int num_worst_tokens, const Config &config, std::optional<EventHandle> &previous_event,
-                           bool async, bool allocate_on_comm_stream, bool use_quant)
+                           bool async, bool allocate_on_comm_stream, bool use_quant, const std::string &quant_type)
 {
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
 
-    at::Tensor expert_ids = new_topk_idx.to(at::kInt);
     int64_t tp_size = 1;
     int64_t tp_rank = 0;
-    int64_t quant_mode = use_quant ? DYNAMIC_SCALES : NO_SCALES;
+    bool is_mxfp8_quant = false;
     auto recv_topk_idx = std::optional<at::Tensor>();
     auto recv_topk_weights = std::optional<at::Tensor>();
     // Wait streams
@@ -208,25 +222,7 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
     auto rank_prefix_matrix = at::empty({num_ranks, num_ranks}, at::dtype(at::kInt).device(x.device()));
     auto channel_prefix_matrix = at::empty({num_ranks, num_channels}, at::dtype(at::kInt).device(x.device()));
     auto recv_channel_prefix_matrix = at::empty({num_ranks, num_channels}, at::dtype(at::kInt).device(x.device()));
-
     at::Tensor new_x = x;
-    // for padding
-    if (topk_idx->size(0) < PADDING_SIZE) {
-        this->is_padding = true;
-        this->padding_cnt = PADDING_SIZE - topk_idx->size(0);
-        std::vector<at::Tensor> x_blocks;
-        if (topk_idx->size(0) != 0) {
-            x_blocks.emplace_back(x);
-        } else {
-            this->ori_x = x.clone();
-        }
-        for (int i = 0; i < this->padding_cnt; i++) {
-            at::Tensor tmp_x = torch::ones({1, x.size(1)}, x.options()) * (i + 1) * 2;
-            x_blocks.emplace_back(tmp_x);
-        }
-        new_x = torch::cat(x_blocks, 0);
-    }
-
     EP_HOST_ASSERT(num_tokens_per_rank.has_value());
     EP_HOST_ASSERT(num_tokens_per_expert.has_value());
 
@@ -248,12 +244,13 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
     // Top-k checks
     int num_topk = 0;
     EP_HOST_ASSERT(topk_idx.has_value());
+    at::Tensor expert_ids = topk_idx.value().to(at::kInt);
     if (topk_idx.has_value()) {
         num_topk = static_cast<int>(topk_idx->size(1));
         EP_HOST_ASSERT(num_experts > 0);
         EP_HOST_ASSERT(topk_idx->dim() == 2 and topk_idx->is_contiguous());
         EP_HOST_ASSERT(topk_weights->dim() == 2 and topk_weights->is_contiguous());
-        EP_HOST_ASSERT(num_tokens == new_topk_idx.size(0));
+        EP_HOST_ASSERT(num_tokens == topk_idx->size(0));
         EP_HOST_ASSERT(num_topk == topk_weights->size(1));
         EP_HOST_ASSERT(topk_weights->scalar_type() == at::kFloat);
     }
@@ -294,12 +291,17 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
     } else {
         HCCL_CHECK(HcclGetCommName(ep_comm, hcom_ep_name));
     }
-    at::Tensor total_recv_token = torch::empty({1}, at::dtype(at::kInt).device(x.device()));
+    // Merge max_bs / total_recv_token / recv_tokens_per_expert into one contiguous buffer,
+    // layout [max_bs, total_recv_token, recv_tokens_per_expert(round*num_local_experts)],
+    // so a single D2H read after notify_dispatch fetches all values back, eliminating multiple host sync stalls.
+    const int64_t nel = static_cast<int64_t>(num_local_experts);
+    at::Tensor recv_header =
+        torch::empty({2 + static_cast<int64_t>(round) * nel}, at::dtype(at::kInt).device(x.device()));
+    at::Tensor max_bs = recv_header.narrow(0, 0, 1);
+    at::Tensor total_recv_token = recv_header.narrow(0, 1, 1);
+    at::Tensor recv_tokens_per_expert = recv_header.narrow(0, 2, static_cast<int64_t>(round) * nel);
     at::Tensor recv_offset = at::empty({round, num_experts}, at::dtype(at::kInt).device(x.device()));
     at::Tensor recv_count = at::empty({round, num_experts}, at::dtype(at::kInt).device(x.device()));
-    at::Tensor max_bs = torch::empty({1}, at::dtype(at::kInt).device(x.device()));
-    at::Tensor recv_tokens_per_expert =
-        torch::empty({round * num_local_experts}, at::dtype(at::kInt).device(x.device()));
     at::Tensor expert_global_offset = at::empty({num_local_experts}, at::dtype(at::kInt).device(x.device()));
     at::Tensor srcrank_in_expert_offset =
         at::empty({num_local_experts * num_ranks}, at::dtype(at::kInt).device(x.device()));
@@ -324,17 +326,58 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
                  recv_offset, expert_global_offset, srcrank_in_expert_offset, r_in_srcrank_offset, total_recv_token,
                  max_bs, recv_tokens_per_expert);
     auto send_token_idx_small = this->send_token_idx_small;
-
-    real_max_bs = static_cast<int64_t>(std::max(max_bs.item<int>(), static_cast<int>(num_worst_tokens)));
+    // Read back the whole recv_header with a single D2H; max_bs / total_recv_token / recv_tokens_per_expert
+    // are all taken from the host cache, avoiding host sync stalls from multiple independent reads around dispatch.
+    auto recv_header_cpu = recv_header.to(at::kCPU);
+    const int32_t *header_ptr = recv_header_cpu.data_ptr<int32_t>();
+    real_max_bs = static_cast<int64_t>(std::max(static_cast<int>(header_ptr[0]), static_cast<int>(num_worst_tokens)));
 
     // dispatch算子内部按照 min(per_round_tokens, real_max_bs)来预留显存
     int64_t global_bs = static_cast<int64_t>(std::min(static_cast<int64_t>(per_round_tokens), real_max_bs) * num_ranks);
 
-    int64_t trt = total_recv_token.item<int>();
+    int64_t trt = static_cast<int64_t>(header_ptr[1]);
     int num_recv_tokens = (trt == 0) ? 1 : trt;
-    auto expandx_out = use_quant ? torch::empty({num_recv_tokens, hidden}, at::dtype(at::kChar).device(x.device()))
-                                 : torch::empty({num_recv_tokens, hidden}, x.options());
-    auto dynamic_scales_out = torch::empty({num_recv_tokens}, at::dtype(at::kFloat).device(x.device()));
+    is_mxfp8_quant = use_quant && (quant_type == "mx_fp8_e4m3" || quant_type == "mx_fp8_e5m2");
+    bool is_mxfp4_quant = use_quant && (quant_type == "mx_fp4_e2m1");
+    bool is_pertoken_fp8_quant = use_quant && quant_type == "pertoken_fp8_e4m3";
+    int64_t quant_mode =
+        use_quant
+            ? (is_mxfp8_quant
+                   ? MXFP8_SCALES
+                   : (is_mxfp4_quant ? MXFP4_SCALES : (is_pertoken_fp8_quant ? PER_TOKEN_FP8_SCALES : DYNAMIC_SCALES)))
+            : NO_SCALES;
+#ifndef __DAV_C310__
+    const bool is_a5_only_quant = is_mxfp8_quant || is_mxfp4_quant || is_pertoken_fp8_quant;
+    if (is_a5_only_quant) {
+        EP_HOST_ASSERT_S(false, quant_type, " is not supported on this device, please use int8 or bf16 instead.");
+    }
+#endif
+    at::Tensor expandx_out;
+    at::Tensor dynamic_scales_out;
+#ifdef __DAV_C310__
+    if (quant_mode == MXFP8_SCALES) {
+        if (quant_type == "mx_fp8_e5m2") {
+            expandx_out = torch::empty({num_recv_tokens, hidden}, at::dtype(at::kFloat8_e5m2).device(x.device()));
+        } else {
+            expandx_out = torch::empty({num_recv_tokens, hidden}, at::dtype(at::kFloat8_e4m3fn).device(x.device()));
+        }
+        dynamic_scales_out =
+            torch::empty({num_recv_tokens * hidden / MX_BLOCK_SIZE}, at::dtype(at::kFloat8_e8m0fnu).device(x.device()));
+    } else if (quant_mode == PER_TOKEN_FP8_SCALES) {
+        expandx_out = torch::empty({num_recv_tokens, hidden}, at::dtype(at::kFloat8_e4m3fn).device(x.device()));
+        dynamic_scales_out = torch::empty({num_recv_tokens}, at::dtype(at::kFloat).device(x.device()));
+    } else if (quant_mode == MXFP4_SCALES) {
+        expandx_out =
+            torch::empty({num_recv_tokens, hidden / MXFP4_HALF}, at::dtype(at::kFloat4_e2m1fn_x2).device(x.device()));
+        dynamic_scales_out =
+            torch::empty({num_recv_tokens * hidden / MX_BLOCK_SIZE}, at::dtype(at::kFloat8_e8m0fnu).device(x.device()));
+    } else
+#endif
+    {
+        expandx_out = use_quant ? torch::empty({num_recv_tokens, hidden}, at::dtype(at::kChar).device(x.device()))
+                                : torch::empty({num_recv_tokens, hidden}, x.options());
+        dynamic_scales_out = torch::empty({num_recv_tokens}, at::dtype(at::kFloat).device(x.device()));
+    }
     auto expand_idx_out = torch::empty({num_recv_tokens * 3}, at::dtype(at::kInt).device(x.device()));
     if (topk_idx.has_value()) {
         recv_topk_idx = at::empty({trt, num_topk}, topk_idx->options());
@@ -346,8 +389,7 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
                  rank,       // rankId
                  hcom_ep_name, tp_size, tp_rank, num_experts, quant_mode, real_max_bs, global_bs, round,
                  per_round_tokens, expandx_out, dynamic_scales_out, expand_idx_out, dispatch_wait_recv_cost_stats_out);
-    auto recv_token_per_exp_cpu = recv_tokens_per_expert.to(at::kCPU);
-    auto recv_token_per_exp_ptr = recv_token_per_exp_cpu.data_ptr<int32_t>();
+    const int32_t *recv_token_per_exp_ptr = header_ptr + 2;
 
     int token_cnt = 0;
     // 多轮处理为一维
@@ -398,7 +440,6 @@ Buffer::notify_verify(const at::Tensor &x, const std::optional<at::Tensor> &x_sc
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
 
-    at::Tensor expert_ids = new_topk_idx.to(at::kInt);
     int64_t tp_size = 1;
     int64_t tp_rank = 0;
     int64_t quant_mode = use_quant ? DYNAMIC_SCALES : NO_SCALES;
@@ -409,24 +450,7 @@ Buffer::notify_verify(const at::Tensor &x, const std::optional<at::Tensor> &x_sc
     auto rank_prefix_matrix = at::empty({num_ranks, num_ranks}, at::dtype(at::kInt).device(x.device()));
     auto channel_prefix_matrix = at::empty({num_ranks, num_channels}, at::dtype(at::kInt).device(x.device()));
     auto recv_channel_prefix_matrix = at::empty({num_ranks, num_channels}, at::dtype(at::kInt).device(x.device()));
-
     at::Tensor new_x = x;
-    // for padding
-    if (topk_idx->size(0) < PADDING_SIZE) {
-        this->is_padding = true;
-        this->padding_cnt = PADDING_SIZE - topk_idx->size(0);
-        std::vector<at::Tensor> x_blocks;
-        if (topk_idx->size(0) != 0) {
-            x_blocks.emplace_back(x);
-        } else {
-            this->ori_x = x.clone();
-        }
-        for (int i = 0; i < this->padding_cnt; i++) {
-            at::Tensor tmp_x = torch::ones({1, x.size(1)}, x.options()) * (i + 1) * 2;
-            x_blocks.emplace_back(tmp_x);
-        }
-        new_x = torch::cat(x_blocks, 0);
-    }
 
     EP_HOST_ASSERT(num_tokens_per_rank.has_value());
     EP_HOST_ASSERT(num_tokens_per_expert.has_value());
@@ -449,12 +473,13 @@ Buffer::notify_verify(const at::Tensor &x, const std::optional<at::Tensor> &x_sc
     // Top-k checks
     int num_topk = 0;
     EP_HOST_ASSERT(topk_idx.has_value());
+    at::Tensor expert_ids = topk_idx.value().to(at::kInt);
     if (topk_idx.has_value()) {
         num_topk = static_cast<int>(topk_idx->size(1));
         EP_HOST_ASSERT(num_experts > 0);
         EP_HOST_ASSERT(topk_idx->dim() == 2 and topk_idx->is_contiguous());
         EP_HOST_ASSERT(topk_weights->dim() == 2 and topk_weights->is_contiguous());
-        EP_HOST_ASSERT(num_tokens == new_topk_idx.size(0));
+        EP_HOST_ASSERT(num_tokens == expert_ids.size(0));
         EP_HOST_ASSERT(num_topk == topk_weights->size(1));
         EP_HOST_ASSERT(topk_weights->scalar_type() == at::kFloat);
     }
@@ -541,37 +566,17 @@ Buffer::intranode_combine(const torch::Tensor &x, const torch::Tensor &topk_idx,
 {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     at::Tensor recv_x = x;
-
-    at::Tensor topk_idx_p = topk_idx;
-    if (this->is_padding) {
-        topk_idx_p = this->new_topk_idx;
-    }
-
-    auto topk_idx_int32 = topk_idx_p.to(at::kInt);
+    auto topk_idx_int32 = topk_idx.to(at::kInt);
     at::Tensor token_src_info = src_idx;
     at::Tensor ep_send_counts = send_head;
     auto device = x.device();
 
-    const int num_tokens = topk_idx_p.size(0);
-    const int num_topk = topk_idx_p.size(1);
+    const int num_tokens = topk_idx.size(0);
+    const int num_topk = topk_idx.size(1);
     at::Tensor expert_scales;
     // for padding
     if (topk_weights.has_value()) {
-        if (!this->is_padding) {
-            expert_scales = topk_weights.value();
-        } else {
-            std::vector<at::Tensor> weight_blocks;
-            if (topk_weights->size(0) != 0) {
-                weight_blocks.emplace_back(topk_weights.value());
-            }
-            for (int i = 0; i < this->padding_cnt; i++) {
-                if (topk_weights.has_value()) {
-                    at::Tensor tmp_weight = torch::arange(0, num_topk, topk_weights->options()).reshape({1, num_topk});
-                    weight_blocks.emplace_back(tmp_weight);
-                }
-            }
-            expert_scales = torch::cat(weight_blocks, 0);
-        }
+        expert_scales = topk_weights.value();
     } else {
         expert_scales = at::ones({num_tokens, num_topk}, at::dtype(at::kFloat).device(device));
     }
@@ -609,15 +614,6 @@ Buffer::intranode_combine(const torch::Tensor &x, const torch::Tensor &topk_idx,
                  tp_send_counts, hcom_ep_name, num_ranks, rank, hcom_ep_name, tp_world_size, tp_rankId,
                  moe_expert_number, real_max_bs, round, per_round_tokens, combined_x, combine_send_cost_stats_out);
 
-    if (this->is_padding) {
-        if (this->padding_cnt == PADDING_SIZE) {
-            combined_x = this->ori_x;
-        } else {
-            combined_x = combined_x.slice(0, 0, PADDING_SIZE - this->padding_cnt);
-        }
-        is_padding = false;
-    }
-
     return {combined_x, recv_topk_weights, event};
 }
 
@@ -636,22 +632,6 @@ Buffer::internode_dispatch(
     int num_channels = config.num_sms / 2;
 
     at::Tensor new_x = x;
-    // for padding
-    if (topk_idx->size(0) < PADDING_SIZE) {
-        this->is_padding = true;
-        this->padding_cnt = PADDING_SIZE - topk_idx->size(0);
-        std::vector<at::Tensor> x_blocks;
-        if (topk_idx->size(0) != 0) {
-            x_blocks.emplace_back(x);
-        } else {
-            this->ori_x = x.clone();
-        }
-        for (int i = 0; i < this->padding_cnt; i++) {
-            at::Tensor tmp_x = torch::zeros({1, x.size(1)}, x.options());
-            x_blocks.emplace_back(tmp_x);
-        }
-        new_x = torch::cat(x_blocks, 0);
-    }
     EP_HOST_ASSERT(num_tokens_per_rank.has_value());
     EP_HOST_ASSERT(num_tokens_per_expert.has_value());
 
@@ -673,33 +653,21 @@ Buffer::internode_dispatch(
     // Top-k checks
     int num_topk = 0;
     EP_HOST_ASSERT(topk_idx.has_value());
+    at::Tensor expert_ids = topk_idx.value().to(at::kInt);
     if (topk_idx.has_value()) {
         num_topk = static_cast<int>(topk_idx->size(1));
         EP_HOST_ASSERT(num_experts > 0);
         EP_HOST_ASSERT(topk_idx->dim() == 2 and topk_idx->is_contiguous());
         EP_HOST_ASSERT(topk_weights->dim() == 2 and topk_weights->is_contiguous());
-        EP_HOST_ASSERT(num_tokens == new_topk_idx.size(0));
+        EP_HOST_ASSERT(num_tokens == expert_ids.size(0));
         EP_HOST_ASSERT(num_topk == topk_weights->size(1));
         EP_HOST_ASSERT(topk_weights->scalar_type() == at::kFloat);
     }
 
     auto device = x.device();
     at::Tensor new_topk_weights;
-    // for padding
     if (topk_weights.has_value()) {
-        if (!this->is_padding) {
-            new_topk_weights = topk_weights.value();
-        } else {
-            std::vector<at::Tensor> weight_blocks;
-            if (topk_weights->size(0) != 0) {
-                weight_blocks.emplace_back(topk_weights.value());
-            }
-            for (int i = 0; i < this->padding_cnt; i++) {
-                at::Tensor tmp_weight = torch::arange(0, num_topk, topk_weights->options()).reshape({1, num_topk});
-                weight_blocks.emplace_back(tmp_weight);
-            }
-            new_topk_weights = torch::cat(weight_blocks, 0);
-        }
+        new_topk_weights = topk_weights.value();
     } else {
         new_topk_weights = at::ones({num_tokens, num_topk}, at::dtype(at::kFloat).device(device));
     }
@@ -728,9 +696,7 @@ Buffer::internode_dispatch(
 
     int64_t quant_mode = use_quant ? DYNAMIC_SCALES : NO_SCALES;
     int64_t global_bs = static_cast<int64_t>(MAX_BATCH_SIZE * num_ranks);
-    at::Tensor expert_ids = new_topk_idx.to(at::kInt);
     at::Tensor xActiveMask = at::empty({1}, at::dtype(at::kInt).device(x.device()));
-
     auto expertTokenNums = at::zeros({1}, at::dtype(at::kLong).device(x.device()));
     auto epRecvCount = at::zeros({1}, at::dtype(at::kInt).device(x.device()));
     auto tpRecvCount = at::zeros({1}, at::dtype(at::kInt).device(x.device()));
@@ -845,22 +811,15 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     at::Tensor recv_x = x;
-
-    at::Tensor topk_idx_p = topk_idx;
-    if (this->is_padding) {
-        topk_idx_p = this->new_topk_idx;
-    }
-
-    auto topk_idx_int32 = topk_idx_p.to(at::kInt);
-    at::Tensor expert_ids = topk_idx_int32;
+    at::Tensor expert_ids = topk_idx.to(at::kInt);
     // In the A2 implementation, the tensor is expanded from [bs, k] to [bs, num_expert].
     at::Tensor expand_idx = src_idx;
     // A2 needs global send counts, [num_expert, num_rank]
     at::Tensor ep_send_counts = send_head;
     auto device = x.device();
 
-    const int num_tokens = topk_idx_p.size(0);
-    const int num_topk = topk_idx_p.size(1);
+    const int num_tokens = topk_idx.size(0);
+    const int num_topk = topk_idx.size(1);
     at::Tensor expert_scales = at::empty({1}, at::dtype(at::kFloat).device(x.device()));
 
     int64_t hidden = static_cast<int>(recv_x.size(1));
@@ -879,7 +838,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     }
 
     // Combine data
-    auto combined_x = torch::empty({new_topk_idx.size(0), hidden}, x.options());
+    auto combined_x = torch::empty({topk_idx.size(0), hidden}, x.options());
     std::optional<torch::Tensor> recv_topk_weights;
     std::optional<EventHandle> event;
     at::Tensor x_active_mask, activation_scale, weight_scale, group_list;
@@ -887,21 +846,14 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     int64_t out_dtype = 0;
     int64_t comm_quant_mode = 0;
     int64_t group_list_type = 0;
+    at::Tensor combine_send_cost_stats_out;
 
     EXEC_NPU_CMD(aclnnMoeDistributeCombineA2, recv_x, expert_ids, expand_idx, ep_send_counts, expert_scales,
                  tp_send_counts, x_active_mask, activation_scale, weight_scale, group_list, expand_scales, offsetInner,
                  offsetOuter, countOuter, hcom_ep_name, num_ranks, rank, moe_expert_number, hcom_ep_name, tp_world_size,
                  tp_rankId, expert_shared_type, shared_expert_num, shared_expert_rank_num, global_bs, out_dtype,
-                 comm_quant_mode, group_list_type, combined_x);
+                 comm_quant_mode, group_list_type, combined_x, combine_send_cost_stats_out);
 
-    if (this->is_padding) {
-        if (this->padding_cnt == PADDING_SIZE) {
-            combined_x = this->ori_x;
-        } else {
-            combined_x = combined_x.slice(0, 0, PADDING_SIZE - this->padding_cnt);
-        }
-        is_padding = false;
-    }
     return {combined_x, recv_topk_weights, event};
 }
 
@@ -910,38 +862,18 @@ std::tuple<at::Tensor, std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Te
 Buffer::low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
                              const std::optional<at::Tensor> &cumulative_local_expert_recv_stats,
                              int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, bool use_fp8,
-                             bool round_scale, bool use_ue8m0, bool async, bool return_recv_hook)
+                             bool round_scale, bool use_ue8m0, bool use_mxfp4, bool async, bool return_recv_hook,
+                             const std::string &quant_mode_name)
 {
-    this->is_padding = false;
     EP_HOST_ASSERT(low_latency_mode);
-    at::Tensor new_x = x;
-    this->new_topk_idx = topk_idx;
-    if (topk_idx.size(0) < PADDING_SIZE) {
-        this->is_padding = true;
-        this->padding_cnt = PADDING_SIZE - topk_idx.size(0);
-        std::vector<at::Tensor> x_blocks;
-        std::vector<at::Tensor> topk_blocks;
-        if (topk_idx.size(0) != 0) {
-            x_blocks.emplace_back(x);
-            topk_blocks.emplace_back(topk_idx);
-        } else {
-            this->ori_x = x.clone();
-        }
-        int topk = static_cast<int>(new_topk_idx.size(1));
-        for (int i = 0; i < this->padding_cnt; i++) {
-            at::Tensor tmp_x = torch::ones({1, x.size(1)}, x.options());
-            at::Tensor tmp_topk = torch::arange(0, topk, topk_idx.options()).reshape({1, topk});
-            x_blocks.emplace_back(tmp_x);
-            topk_blocks.emplace_back(tmp_topk);
-        }
-        new_x = torch::cat(x_blocks, 0);
-        this->new_topk_idx = torch::cat(topk_blocks, 0);
-    }
+    EP_HOST_ASSERT(num_max_dispatch_tokens_per_rank >= x.size(0));
+    static_cast<void>(use_fp8);
+    static_cast<void>(use_ue8m0);
+    static_cast<void>(use_mxfp4);
 
-    EP_HOST_ASSERT(num_max_dispatch_tokens_per_rank >= new_x.size(0));
-
-    auto num_tokens = static_cast<int>(new_x.size(0)), hidden = static_cast<int>(new_x.size(1));
-    auto num_scales = hidden / 128, num_topk = static_cast<int>(new_topk_idx.size(1));
+    auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
+    auto num_scales = hidden / 128, num_topk = static_cast<int>(topk_idx.size(1));
+    EP_HOST_ASSERT(num_ranks > shared_expert_rank_num);
     int32_t num_local_experts = num_experts / (num_ranks - shared_expert_rank_num);
     int64_t global_bs = num_max_dispatch_tokens_per_rank * num_ranks;
     auto num_max_tokens = 0;
@@ -952,14 +884,62 @@ Buffer::low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
         num_max_tokens = global_bs * std::min(num_topk, num_local_experts);
     }
     auto max_size = std::max(num_tokens * num_topk, num_max_tokens * 128);
+    const bool is_mxfp8_quant = quant_mode_name == "mx_fp8_e4m3" || quant_mode_name == "mx_fp8_e5m2";
+    const bool is_mxfp4_quant = quant_mode_name == "mx_fp4_e2m1";
+    const bool is_pertoken_fp8_quant = quant_mode_name == "pertoken_fp8_e4m3";
 
+#ifndef __DAV_C310__
+    const bool is_a5_only_quant = is_mxfp8_quant || is_mxfp4_quant || is_pertoken_fp8_quant;
+    if (is_a5_only_quant) {
+        EP_HOST_ASSERT_S(false, quant_mode_name, " is not supported on this device, please use int8 or bf16 instead.");
+    }
+#endif
+
+    int64_t quant_mode = NO_SCALES;
+    if (quant_mode_name == "int8") {
+        quant_mode = DYNAMIC_SCALES;
+    }
+#ifdef __DAV_C310__
+    else if (is_mxfp8_quant) {
+        quant_mode = MXFP8_SCALES;
+    } else if (is_mxfp4_quant) {
+        quant_mode = MXFP4_SCALES;
+    } else if (is_pertoken_fp8_quant) {
+        quant_mode = PER_TOKEN_FP8_SCALES;
+    }
+#endif
+    else {
+        EP_HOST_ASSERT(quant_mode_name == "none");
+    }
     // Allocate packed tensors
-    auto device = new_x.device();
-    auto packed_recv_x =
-        at::empty({num_max_tokens, hidden}, new_x.options().dtype(use_fp8 ? at::kChar : at::kBFloat16));
-    auto packed_recv_x_scales = at::empty({num_max_tokens}, at::dtype(at::kFloat).device(device));
-    auto expandIdx = at::empty({max_size}, at::dtype(at::kInt).device(device));
+    auto device = x.device();
+    at::Tensor packed_recv_x, packed_recv_x_scales;
+    if (quant_mode == 0) {
+        packed_recv_x = at::empty({num_max_tokens, hidden}, at::dtype(at::kBFloat16).device(device));
+        packed_recv_x_scales = at::empty({1}, at::dtype(at::kFloat).device(device));
+    } else if (quant_mode == 2) {
+        packed_recv_x = at::empty({num_max_tokens, hidden}, at::dtype(at::kChar).device(device));
+        packed_recv_x_scales = at::empty({num_max_tokens}, at::dtype(at::kFloat).device(device));
+    }
+#ifdef __DAV_C310__
+    else if (quant_mode == PER_TOKEN_FP8_SCALES) {  // per-token fp8_e4m3
+        packed_recv_x = at::empty({num_max_tokens, hidden}, at::dtype(at::kFloat8_e4m3fn).device(device));
+        packed_recv_x_scales = at::empty({num_max_tokens}, at::dtype(at::kFloat).device(device));
+    } else if (quant_mode == 3) {  // MXFP8
+        packed_recv_x = quant_mode_name == "mx_fp8_e5m2"
+                            ? at::empty({num_max_tokens, hidden}, at::dtype(at::kFloat8_e5m2).device(device))
+                            : at::empty({num_max_tokens, hidden}, at::dtype(at::kFloat8_e4m3fn).device(device));
+        packed_recv_x_scales =
+            at::empty({num_max_tokens * hidden / MX_BLOCK_SIZE}, at::dtype(at::kFloat8_e8m0fnu).device(device));
+    } else if (quant_mode == 4) {  // fp4_e2m1
+        packed_recv_x =
+            at::empty({num_max_tokens, hidden / MXFP4_HALF}, at::dtype(at::kFloat4_e2m1fn_x2).device(device));
+        packed_recv_x_scales =
+            at::empty({num_max_tokens * hidden / MX_BLOCK_SIZE}, at::dtype(at::kFloat8_e8m0fnu).device(device));
+    }
+#endif
 
+    auto expandIdx = at::empty({max_size}, at::dtype(at::kInt).device(device));
     int32_t server_num = num_ranks / LOCAL_RANK_SIZE;
     at::Tensor ep_recv_count =
         at::empty({num_local_experts * num_ranks}, at::dtype(at::kInt).device(device));  // A2 non-layered / A3
@@ -968,11 +948,11 @@ Buffer::low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
     at::Tensor scales;
     at::Tensor active_mask;
     int enable_neg_one = get_value_from_env("MOE_ENABLE_TOPK_NEG_ONE", 0);
-    int64_t quant_mode = use_fp8 ? 2 : 0;
     int64_t tp_size = 1;
     int64_t tp_rank = 0;
     int64_t expert_shard_type = 0;
     int outType = get_value_from_env("MOE_EXPERT_TOKEN_NUMS_TYPE", 1);
+    int isCcu = get_value_from_env("MOE_ENABLE_CCU", 0);
     char *comm_alg;
     int64_t expert_token_nums_type = outType;
 
@@ -1001,36 +981,41 @@ Buffer::low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
 
     if (soc_version == op::SocVersion::ASCEND910B) {
         comm_alg = "fullmesh";
+    } else if (isCcu == 1) {
+        comm_alg = "ccu";
     } else {
         comm_alg = "fullmesh_v1";
     }
 
     if (enable_neg_one) {
         EP_HOST_ASSERT(isLayered == false);
-        active_mask = (new_topk_idx >= 0).to(torch::kBool);
+        active_mask = (topk_idx >= 0).to(torch::kBool);
     }
-
-    EXEC_NPU_CMD(aclnnMoeDistributeDispatchV2, new_x, new_topk_idx,
-                 scales,        // smooth scales,
-                 active_mask,   // active_mask
-                 hcom_ep_name,  // ep
-                 num_ranks,     // rankSize
-                 rank,          // rankId
-                 num_experts,
-                 hcom_tp_name,            // tp
-                 tp_size,                 // tp_size
-                 tp_rank,                 // tp_rank
+    EXEC_NPU_CMD(aclnnMoeLowLatencyDispatchV2,
+                 x,                       // x
+                 topk_idx,                // expertIds
+                 scales,                  // scalesOptional
+                 active_mask,             // xActiveMaskOptional
+                 hcom_ep_name,            // groupEp
+                 num_ranks,               // epWorldSize
+                 rank,                    // epRankId
+                 num_experts,             // moeExpertNum
+                 hcom_tp_name,            // groupTp
+                 tp_size,                 // tpWorldSize
+                 tp_rank,                 // tpRankId
                  expert_shard_type,       // expert_shard_type
                  shared_expert_num,       // shared_expert_num
                  shared_expert_rank_num,  // shared_expert_rank_num
                  quant_mode,
                  global_bs,               // global_bs
                  expert_token_nums_type,  // expert_token_nums_type
-                 comm_alg, packed_recv_x,
+                 comm_alg,
+                 packed_recv_x,         // expandXOut
                  packed_recv_x_scales,  // dynamicScalesOut
-                 expandIdx,
-                 packed_recv_count,  // expertTokenNumsOut
-                 ep_recv_count, tp_recv_count);
+                 expandIdx,             // assistInfoForCombineOut
+                 packed_recv_count,     // expertTokenNumsOut
+                 ep_recv_count,         // epRecvCountsOut
+                 tp_recv_count);        // tpRecvCountsOut
 
     // Return values
     return {packed_recv_x, packed_recv_x_scales,        packed_recv_count, expandIdx, ep_recv_count,
@@ -1041,27 +1026,11 @@ std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<v
     const at::Tensor &x, const at::Tensor &topk_idx, const at::Tensor &topk_weights, const at::Tensor &src_info,
     const at::Tensor &layout_range, int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
     const at::Tensor &packed_recv_count, bool zero_copy, bool async, bool return_recv_hook,
-    const std::optional<at::Tensor> &out)
+    const std::optional<at::Tensor> &out, bool use_mxfp8)
 {
-    at::Tensor new_idx = topk_idx;
-    at::Tensor new_scales = topk_weights;
-    if (this->is_padding) {
-        std::vector<at::Tensor> scales_blocks;
-        if (this->padding_cnt != PADDING_SIZE) {
-            scales_blocks.emplace_back(topk_weights);
-        }
-        for (int i = 0; i < this->padding_cnt; i++) {
-            at::Tensor tmp_scales = torch::zeros({1, topk_weights.size(1)}, topk_weights.options());
-            scales_blocks.emplace_back(tmp_scales);
-        }
-        new_idx = this->new_topk_idx;
-        this->new_scales = torch::cat(scales_blocks, 0);
-        new_scales = this->new_scales;
-    }
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == at::kBFloat16);
-    EP_HOST_ASSERT(num_max_dispatch_tokens_per_rank >= new_idx.size(0));
-    // EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
+    EP_HOST_ASSERT(num_max_dispatch_tokens_per_rank >= topk_idx.size(0));
 
     // get ep & tp name
     char hcom_ep_name[HCOMM_NAME_LEN];
@@ -1074,24 +1043,27 @@ std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<v
 
     auto device = x.device();
     at::Tensor expand_x = x;
-    at::Tensor expert_ids = new_idx;
+    at::Tensor expert_ids = topk_idx;
     at::Tensor expand_idx = src_info;  // handle[0] = src_info
     at::Tensor ep_send_counts = layout_range;
-    at::Tensor expert_scales = new_scales;
+    at::Tensor expert_scales = topk_weights;
     at::Tensor tp_send_counts = at::empty({1}, at::dtype(at::kInt).device(device));
     at::Tensor x_active_mask, activation_scale, weight_scale, group_list, expand_scales;
     int enable_neg_one = get_value_from_env("MOE_ENABLE_TOPK_NEG_ONE", 0);
+    int isCcu = get_value_from_env("MOE_ENABLE_CCU", 0);
     int64_t tp_world_size = 1;
     int64_t tp_rankId = 0;
     int64_t expert_shared_type = 0;
     int64_t global_bs = num_max_dispatch_tokens_per_rank * num_ranks;
     int64_t out_dtype = 0;
-    int64_t comm_quant_mode = 0;
+    constexpr int64_t MXFP8_E4M3_COMM_QUANT = 3;
+    int64_t comm_quant_mode = use_mxfp8 ? MXFP8_E4M3_COMM_QUANT : 0;
     int64_t group_list_type = 0;
     bool isLayered = false;
     char *comm_alg;
+    at::Tensor combine_send_cost_stats_out;
 
-    auto num_combined_tokens = static_cast<int>(new_scales.size(0));
+    auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
     auto hidden = static_cast<int>(x.size(1));
     at::Tensor shared_expert_x{nullptr};
     at::Tensor combined_x = at::empty({num_combined_tokens, hidden}, x.options());
@@ -1107,82 +1079,59 @@ std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<v
 
     if (soc_version == op::SocVersion::ASCEND910B) {
         comm_alg = "fullmesh";
+    } else if (isCcu == 1) {
+        comm_alg = "ccu";
     } else {
         comm_alg = "fullmesh_v1";
     }
 
     if (enable_neg_one) {
         EP_HOST_ASSERT(isLayered == false);
-        x_active_mask = (new_topk_idx >= 0).to(torch::kBool);
+        x_active_mask = (expert_ids >= 0).to(torch::kBool);
     }
-
-    EXEC_NPU_CMD(aclnnMoeDistributeCombineV2, expand_x, expert_ids, expand_idx, ep_send_counts, expert_scales,
+    EXEC_NPU_CMD(aclnnMoeLowLatencyCombineV2, expand_x, expert_ids, expand_idx, ep_send_counts, expert_scales,
                  tp_send_counts, x_active_mask, activation_scale, weight_scale, group_list, expand_scales,
                  shared_expert_x, hcom_ep_name, num_ranks, rank, num_experts, hcom_tp_name, tp_world_size, tp_rankId,
                  expert_shared_type, shared_expert_num, shared_expert_rank_num, global_bs, out_dtype, comm_quant_mode,
-                 group_list_type, comm_alg, combined_x);
-    if (this->is_padding) {
-        if (this->padding_cnt == PADDING_SIZE) {
-            combined_x = this->ori_x;
-        } else {
-            combined_x = combined_x.slice(0, 0, PADDING_SIZE - this->padding_cnt);
-        }
-        is_padding = false;
-    }
+                 group_list_type, comm_alg, combined_x, combine_send_cost_stats_out);
+
     return {combined_x, event, std::function<void()>([] {})};
 }
 
-std::vector<at::Tensor> Buffer::fused_deep_moe(const at::Tensor &x, const at::Tensor &expert_ids,
-                                               const at::Tensor &gmm1_permuted_weight,
-                                               const at::Tensor &gmm1_permuted_weight_scale,
-                                               const at::Tensor &gmm2_weight, const at::Tensor &gmm2_weight_scale,
-                                               const at::Tensor &expert_scales_optional,
-                                               int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
-                                               int quant_mode)
+std::vector<at::Tensor> Buffer::fused_deep_moe(
+    const at::Tensor &x, const at::Tensor &expert_ids, const at::Tensor &gmm1_permuted_weight,
+    const at::Tensor &gmm1_permuted_weight_scale, const at::Tensor &gmm2_weight, const at::Tensor &gmm2_weight_scale,
+    const at::Tensor &expert_scales_optional, int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
+    int quant_mode, bool profile_enable, const std::optional<std::string> &activation, std::optional<double> beta,
+    std::optional<double> linear_beta)
 {
+    EP_HOST_ASSERT(x.dim() == 2);
     EP_HOST_ASSERT(expert_ids.dim() == 2);
     EP_HOST_ASSERT(expert_scales_optional.dim() == 2);
-
-    this->is_padding = false;
-    at::Tensor new_x = x;
-    this->new_topk_idx = expert_ids;
-    at::Tensor new_scales = expert_scales_optional;
-
-    if (expert_ids.size(0) < PADDING_SIZE) {
-        this->is_padding = true;
-        this->padding_cnt = PADDING_SIZE - expert_ids.size(0);
-
-        std::vector<at::Tensor> x_blocks;
-        std::vector<at::Tensor> idx_blocks;
-
-        if (expert_ids.size(0) != 0) {
-            x_blocks.emplace_back(x);
-            idx_blocks.emplace_back(expert_ids);
-        } else {
-            this->ori_x = x.clone();  // store the original input when the batch is completely empty
-        }
-
-        int topk = static_cast<int>(expert_ids.size(1));
-        for (int i = 0; i < this->padding_cnt; i++) {
-            at::Tensor tmp_x = torch::ones({1, x.size(1)}, x.options());
-            at::Tensor tmp_idx = torch::arange(0, topk, expert_ids.options()).reshape({1, topk});
-            x_blocks.emplace_back(tmp_x);
-            idx_blocks.emplace_back(tmp_idx);
-        }
-        new_x = torch::cat(x_blocks, 0);
-        this->new_topk_idx = torch::cat(idx_blocks, 0);
-
-        // padding expert_scales_optional
-        std::vector<at::Tensor> scales_blocks;
-        if (this->padding_cnt != PADDING_SIZE) {
-            scales_blocks.emplace_back(expert_scales_optional);
-        }
-        for (int i = 0; i < this->padding_cnt; i++) {
-            at::Tensor tmp_scales = torch::zeros({1, expert_scales_optional.size(1)}, expert_scales_optional.options());
-            scales_blocks.emplace_back(tmp_scales);
-        }
-        new_scales = torch::cat(scales_blocks, 0);
+    EP_HOST_ASSERT(x.size(0) == expert_ids.size(0));
+    EP_HOST_ASSERT(expert_ids.sizes() == expert_scales_optional.sizes());
+#if !defined(__DAV_C310__)
+    EP_HOST_ASSERT_S(quant_mode == FUSED_DEEP_MOE_NO_QUANT || quant_mode == FUSED_DEEP_MOE_INT8_QUANT,
+                     "fused_deep_moe only supports quant_mode 0 (BF16) or 1 (INT8), got ", quant_mode);
+#endif
+    const int64_t quant_mode_i64 = static_cast<int64_t>(quant_mode);
+    TORCH_CHECK(activation == "swiglu" || activation == "situ", "activation must be 'swiglu' or 'situ', got '",
+                activation.value_or("None"), "'");
+    const int64_t activation_type_i64 =
+        activation == "situ" ? FUSED_DEEP_MOE_ACTIVATION_SITU : FUSED_DEEP_MOE_ACTIVATION_SWIGLU;
+    const double beta_value = beta.value_or(4.0);
+    if (activation_type_i64 == FUSED_DEEP_MOE_ACTIVATION_SITU) {
+        TORCH_CHECK(beta_value > 0.0, "beta must be > 0 for SiTU, got ", beta_value);
+        TORCH_CHECK(!linear_beta.has_value() || *linear_beta > 0.0,
+                    "linear_beta must be > 0 when provided for SiTU, got ",
+                    linear_beta.has_value() ? *linear_beta : 0.0);
     }
+    const double linear_beta_value = linear_beta.value_or(0.0);
+#if !defined(__DAV_C310__)
+    TORCH_CHECK(activation_type_i64 != FUSED_DEEP_MOE_ACTIVATION_SITU,
+                "SiTU requires the Ascend 950 fused_deep_moe kernel; the current fused_deep_moe kernel only supports "
+                "SwiGLU");
+#endif
 
     char hcom_ep_name[128];
     if (!moe_all_to_all_group_name.empty()) {
@@ -1191,13 +1140,112 @@ std::vector<at::Tensor> Buffer::fused_deep_moe(const at::Tensor &x, const at::Te
         HCCL_CHECK(HcclGetCommName(ep_comm, hcom_ep_name));
     }
 
-    int64_t global_bs = std::max(new_topk_idx.size(0), num_max_dispatch_tokens_per_rank) * num_ranks;
-
     auto x_shape = x.sizes();
-    int h = x_shape[1];
-    int bs = this->new_topk_idx.size(0);
+    int64_t h = x_shape[1];
+    int64_t bs = expert_ids.size(0);
 
+#if defined(__DAV_C310__)
+    const int64_t capacity = num_max_dispatch_tokens_per_rank;
+    TORCH_CHECK(capacity >= bs,
+                "num_max_dispatch_tokens_per_rank must be greater than or equal to the local token count, got ",
+                capacity, " < ", bs);
+    const int64_t global_bs = capacity * num_ranks;
+
+    at::Tensor x_padded = x;
+    at::Tensor expert_ids_padded = expert_ids;
+    at::Tensor expert_scales_padded = expert_scales_optional;
+    const bool use_x_active_mask = capacity > bs;
+    at::Tensor x_active_mask;
+    if (use_x_active_mask) {
+        x_padded = at::zeros({capacity, h}, x.options());
+        x_padded.narrow(0, 0, bs).copy_(x);
+
+        expert_ids_padded = at::zeros({capacity, expert_ids.size(1)}, expert_ids.options());
+        expert_ids_padded.narrow(0, 0, bs).copy_(expert_ids);
+
+        expert_scales_padded = at::zeros({capacity, expert_scales_optional.size(1)}, expert_scales_optional.options());
+        expert_scales_padded.narrow(0, 0, bs).copy_(expert_scales_optional);
+
+        x_active_mask = at::zeros({capacity}, x.options().dtype(at::kBool));
+        x_active_mask.narrow(0, 0, bs).fill_(true);
+    }
+
+    std::vector<at::Tensor> gmm1_weight_storage{gmm1_permuted_weight};
+    std::vector<at::Tensor> gmm1_scale_storage{gmm1_permuted_weight_scale};
+    std::vector<at::Tensor> gmm2_weight_storage{gmm2_weight};
+    std::vector<at::Tensor> gmm2_scale_storage{gmm2_weight_scale};
+    at::TensorList gmm1_weight_list(gmm1_weight_storage);
+    at::TensorList gmm1_scale_list(gmm1_scale_storage);
+    at::TensorList gmm2_weight_list(gmm2_weight_storage);
+    at::TensorList gmm2_scale_list(gmm2_scale_storage);
+    at::Tensor output = at::empty({capacity, h}, x.options());
+    at::Tensor share_output = at::empty({capacity, h}, x.options());
+    int64_t num_local_experts = num_experts / num_ranks;
+    at::Tensor expert_token_nums = at::empty({num_local_experts}, x.options().dtype(at::kLong));
+    auto profile_ctx = profiling::fused_deep_moe_a5::PrepareLaunch(num_experts, num_ranks, profile_enable);
+    bool use_profile = profile_ctx.enabled;
+    int64_t profile_enable_i64 = static_cast<int64_t>(use_profile);
+    const at::Tensor *profile_buffer_ptr = profile_ctx.profileBuffer;
+    int64_t profile_buffer_bytes_i64 = profile_ctx.profileBufferBytes;
+    int64_t profile_launch_id_i64 = profile_ctx.launchId;
+
+    if (use_profile) {
+        TORCH_CHECK(profile_buffer_ptr != nullptr, "FusedDeepMoe profiling requires a valid profile buffer.");
+        if (use_x_active_mask) {
+            EXEC_NPU_CMD(aclnnFusedDeepMoe, x_padded, expert_ids_padded, gmm1_weight_list, gmm1_scale_list,
+                         gmm2_weight_list, gmm2_scale_list, expert_scales_padded,
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         x_active_mask, *profile_buffer_ptr, hcom_ep_name, num_ranks, rank, num_experts, quant_mode_i64,
+                         global_bs, activation_type_i64, beta_value, linear_beta_value, profile_enable_i64,
+                         profile_buffer_bytes_i64, profile_launch_id_i64, output, share_output, expert_token_nums);
+        } else {
+            EXEC_NPU_CMD(aclnnFusedDeepMoe, x_padded, expert_ids_padded, gmm1_weight_list, gmm1_scale_list,
+                         gmm2_weight_list, gmm2_scale_list, expert_scales_padded,
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), *profile_buffer_ptr, hcom_ep_name, num_ranks,
+                         rank, num_experts, quant_mode_i64, global_bs, activation_type_i64, beta_value,
+                         linear_beta_value, profile_enable_i64, profile_buffer_bytes_i64, profile_launch_id_i64, output,
+                         share_output, expert_token_nums);
+        }
+        profiling::fused_deep_moe_a5::CompleteLaunch(profile_ctx, rank);
+    } else {
+        if (use_x_active_mask) {
+            EXEC_NPU_CMD(aclnnFusedDeepMoe, x_padded, expert_ids_padded, gmm1_weight_list, gmm1_scale_list,
+                         gmm2_weight_list, gmm2_scale_list, expert_scales_padded,
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         x_active_mask, static_cast<const std::nullptr_t &>(nullptr), hcom_ep_name, num_ranks, rank,
+                         num_experts, quant_mode_i64, global_bs, activation_type_i64, beta_value, linear_beta_value,
+                         profile_enable_i64, profile_buffer_bytes_i64, profile_launch_id_i64, output, share_output,
+                         expert_token_nums);
+        } else {
+            EXEC_NPU_CMD(aclnnFusedDeepMoe, x_padded, expert_ids_padded, gmm1_weight_list, gmm1_scale_list,
+                         gmm2_weight_list, gmm2_scale_list, expert_scales_padded,
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         static_cast<const std::nullptr_t &>(nullptr), static_cast<const std::nullptr_t &>(nullptr),
+                         hcom_ep_name, num_ranks, rank, num_experts, quant_mode_i64, global_bs, activation_type_i64,
+                         beta_value, linear_beta_value, profile_enable_i64, profile_buffer_bytes_i64,
+                         profile_launch_id_i64, output, share_output, expert_token_nums);
+        }
+    }
+
+    if (use_x_active_mask) {
+        output = output.narrow(0, 0, bs);
+    }
+
+    return {output, expert_token_nums.to(expert_ids.scalar_type())};
+#else
+    int64_t global_bs = std::max(expert_ids.size(0), num_max_dispatch_tokens_per_rank) * num_ranks;
     at::Tensor output = at::empty({bs, h}, x.options());
+    auto gmm1_permuted_weight_scale_f32 = gmm1_permuted_weight_scale.to(at::kFloat);
+    auto gmm2_weight_scale_f32 = gmm2_weight_scale.to(at::kFloat);
 
     bool is_shared_expert = (rank < shared_expert_rank_num);
     int64_t num_local_experts = is_shared_expert ? 1 : num_experts / (num_ranks - shared_expert_rank_num);
@@ -1205,24 +1253,67 @@ std::vector<at::Tensor> Buffer::fused_deep_moe(const at::Tensor &x, const at::Te
 
     EXEC_NPU_CMD(aclnnFusedDeepMoe,
                  // input
-                 new_x, this->new_topk_idx, gmm1_permuted_weight, gmm1_permuted_weight_scale, gmm2_weight,
-                 gmm2_weight_scale, static_cast<const std::nullptr_t &>(nullptr), new_scales,
+                 x, expert_ids, gmm1_permuted_weight, gmm1_permuted_weight_scale_f32, gmm2_weight,
+                 gmm2_weight_scale_f32, static_cast<const std::nullptr_t &>(nullptr), expert_scales_optional,
                  // attr
-                 hcom_ep_name, num_ranks, rank, num_experts, shared_expert_num, shared_expert_rank_num, quant_mode,
+                 hcom_ep_name, num_ranks, rank, num_experts, shared_expert_num, shared_expert_rank_num, quant_mode_i64,
                  global_bs,
                  // output
                  output, ep_recv_count);
 
-    // ---------- unpadding ----------
-    if (this->is_padding) {
-        if (expert_ids.size(0) == 0) {
-            output = this->ori_x;
-        } else {
-            output = output.slice(0, 0, PADDING_SIZE - this->padding_cnt);
-        }
-        this->is_padding = false;
+    return {output, ep_recv_count};
+#endif
+}
+
+void Buffer::begin_profile(int64_t num_profile_skip_launches, int64_t num_profile_active_launches,
+                           const std::string &profile_trace_dir)
+{
+    profiling::runtime::BeginSession(num_profile_skip_launches, num_profile_active_launches, profile_trace_dir,
+                                     num_ranks);
+    profiling::runtime::CaptureSessionBeginAnchor(rank);
+}
+
+void Buffer::end_profile()
+{
+    if (!profiling::runtime::IsSessionActive()) {
+        return;
+    }
+    profiling::runtime::CaptureSessionEndAnchor(rank);
+    profiling::runtime::EndSession(rank);
+}
+
+std::vector<at::Tensor> Buffer::dispatch_ffn_combine(const at::Tensor &x, const at::Tensor &expert_ids,
+                                                     const at::Tensor &weight1, const at::Tensor &scale1,
+                                                     const at::Tensor &weight2, const at::Tensor &scale2,
+                                                     const at::Tensor &expert_scales, int64_t max_output_size,
+                                                     int64_t num_experts, int quant_mode) const
+{
+    EP_HOST_ASSERT(expert_ids.dim() == 2);
+    EP_HOST_ASSERT(expert_scales.dim() == 2);
+    EP_HOST_ASSERT(max_output_size > 0);
+
+    char hcom_ep_name[128];
+    if (!moe_all_to_all_group_name.empty()) {
+        std::memcpy(hcom_ep_name, moe_all_to_all_group_name.data(), moe_all_to_all_group_name.size() + 1);
+    } else {
+        HCCL_CHECK(HcclGetCommName(ep_comm, hcom_ep_name));
     }
 
-    return {output, ep_recv_count};
+    int h = x.size(1);
+    int bs = expert_ids.size(0);
+    at::Tensor output = at::empty({bs, h}, x.options());
+
+    int64_t num_local_experts = num_experts / num_ranks;
+    at::Tensor expert_token_nums = at::empty({num_local_experts}, expert_ids.options());
+
+    bool is_int8 = weight1.scalar_type() == at::ScalarType::Char;
+    if (is_int8) {
+        EXEC_NPU_CMD(aclnnDispatchFFNCombine, x, weight1, weight2, expert_ids, scale1, scale2, expert_scales,
+                     hcom_ep_name, num_ranks, rank, max_output_size, output, expert_token_nums);
+    } else {
+        // TODO: Implement aclnnDispatchFFNCombineBF16 when available
+        EP_HOST_ASSERT_S(false, "BF16 mode not yet supported for dispatch_ffn_combine");
+    }
+    return {output, expert_token_nums};
 }
 }  // namespace deep_ep

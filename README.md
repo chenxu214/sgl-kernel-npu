@@ -24,6 +24,8 @@ For contribution guidelines, please refer to the [Contribution Guide](docs/devel
 
 DeepEP-Ascend provides optimized all-to-all communication kernels for Expert Parallelism in MoE models.
 
+**CANN and CI coverage:** A2/A3 CI validates CANN 9.0.0 and 9.1.0. A5 supports CANN 9.0.0 and 9.1.0; its current CI validates 9.1.0. CANN 8.5.0 runners and test matrices have been retired, so compatibility with 8.5.0 is no longer verified. A2 multi-node CI has been disabled since September 2, 2026 because the reduced node pool cannot sustain the CI workload. Manual tests remain available; see [DeepEP CI status and restoration conditions](python/deep_ep/README.md#ci-coverage-and-a2-multi-node-status).
+
 **Communication Modes:**
 - **Normal Mode**: High-throughput dispatch and combine operations for training and prefill phases (up to 65536 tokens/batch for A3 and 8192 tokens/batch for A2)
 - **Low-Latency Mode**: Optimized for production inference with small batch sizes (128 tokens/batch), achieving sub-150us latency
@@ -49,6 +51,7 @@ SGLang-Kernel-NPU provides a comprehensive set of optimized inference kernels:
 
 **Normalization:**
 - RMSNorm
+- Target-specific Gemma RMSNorm provider (native on 910, ACLNN on 950)
 - Fused Add + RMSNorm + Bias
 - Split QKV + RMSNorm + RoPE fusion
 
@@ -81,7 +84,16 @@ SGLang-Kernel-NPU provides a comprehensive set of optimized inference kernels:
 - Batch MatMul with transpose
 
 
+## Accessing Ascend NPU
+If you need to access Ascend NPU computing resources for development or testing, please visit the [HiDevLab - Online Development](https://hidevlab.huawei.com/online-develop-intro) page on the Huawei HiDevLab platform to apply for free access.
+
+
 ## Quick Start
+
+Before building from source, initialize the submodule(s):
+```bash
+git submodule update --init --recursive
+```
 
 DeepEP-Ascend: Ascend Implementation of DeepEP. [README](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md)
 

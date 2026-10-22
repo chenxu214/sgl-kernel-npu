@@ -50,7 +50,7 @@ extern "C" {
  * @return aclnnStatus: 返回值，返回状态码
  *
  */
-__attribute__((visibility("default"))) aclnnStatus aclnnMoeDistributeCombineV2GetWorkspaceSize(
+__attribute__((visibility("default"))) aclnnStatus aclnnMoeLowLatencyCombineV2GetWorkspaceSize(
     const aclTensor *expandX, const aclTensor *expertIds, const aclTensor *assistInfoForCombine,
     const aclTensor *epSendCounts, const aclTensor *expertScales, const aclTensor *tpSendCountsOptional,
     const aclTensor *xActiveMaskOptional, const aclTensor *activationScaleOptional,
@@ -58,7 +58,8 @@ __attribute__((visibility("default"))) aclnnStatus aclnnMoeDistributeCombineV2Ge
     const aclTensor *sharedExpertXOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
     int64_t sharedExpertRankNum, int64_t globalBs, int64_t outDtype, int64_t commQuantMode, int64_t groupListType,
-    char *commAlg, const aclTensor *xOut, uint64_t *workspaceSize, aclOpExecutor **executor);
+    char *commAlg, const aclTensor *xOut, const aclTensor *sendCostStats, uint64_t *workspaceSize,
+    aclOpExecutor **executor);
 
 /**
  * @brief aclnnMoeDistributeCombineV2的第二段接口，用于执行计算。
@@ -69,7 +70,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnMoeDistributeCombineV2Ge
  * @param [in] stream: acl stream流。
  * @return aclnnStatus: 返回状态码
  */
-__attribute__((visibility("default"))) aclnnStatus aclnnMoeDistributeCombineV2(void *workspace, uint64_t workspaceSize,
+__attribute__((visibility("default"))) aclnnStatus aclnnMoeLowLatencyCombineV2(void *workspace, uint64_t workspaceSize,
                                                                                aclOpExecutor *executor,
                                                                                aclrtStream stream);
 

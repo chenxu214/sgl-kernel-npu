@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 #define SGL_KERNEL_NPU_KERNEL_SGMV_EXPAND_H
 
 #include "kernel_operator.h"
+#include "lora_common_kernel.h"
 
 template <typename scalar_t>
 class SGMVExpand
@@ -102,11 +103,18 @@ public:
         if (endIdx > batchSize_) {
             endIdx = batchSize_;
         }
+
+        int64_t requestBlock = 0;
+        lora_common::BlockIterator blockIterator(seqLenGm_);
         for (int64_t idx = startIdx; idx < endIdx; idx++) {
             yOffset_ = outputFullDim_ * idx + sliceOffset_;
 
-            // Set up LoRA index
-            CopyInIndex(idx);
+            requestBlock = blockIterator.GetBlockIdx(idx);
+            if (requestBlock < 0) {
+                continue;
+            }
+
+            reqLoRAIndex_ = loraIndicesGm_.GetValue(requestBlock);
             if (reqLoRAIndex_ < 0) {
                 continue;
             }
@@ -128,22 +136,6 @@ public:
     }
 
 private:
-    __aicore__ inline void CopyInIndex(const int64_t idx)
-    {
-        // Look up the LoRA index
-        int64_t weightIdx = idx;
-        uint64_t i = 0;
-        for (; i < seqLenGm_.GetSize(); i++) {
-            int64_t repeatValue = seqLenGm_.GetValue(i);
-            if (weightIdx >= repeatValue) {
-                weightIdx -= repeatValue;
-                continue;
-            }
-            break;
-        }
-        reqLoRAIndex_ = (i < seqLenGm_.GetSize()) ? loraIndicesGm_.GetValue(i) : -1;
-    }
-
     __aicore__ inline void ComputeLastIteration()
     {
         int32_t remainingY = outputHiddenDim_ % Y_OUT_TILE_NUM_ELEMENTS;
@@ -202,7 +194,7 @@ private:
             }
         } else {
             Cast(xDup, xLocal, AscendC::RoundMode::CAST_NONE, maxLoRARank_);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
 
             for (int32_t i = maxLoRARank_; i < NUM_ELEMENTS_PER_REPEAT; i += maxLoRARank_) {
                 for (int32_t j = 0; j < maxLoRARank_; j++) {
@@ -234,15 +226,15 @@ private:
         AscendC::LocalTensor<Y_T> yInLocal = inQueueY_.DeQue<Y_T>();
         AscendC::LocalTensor<float> yInLocalFP32 = inBufferY_.Get<float>();
         Cast(yInLocalFP32, yInLocal, AscendC::RoundMode::CAST_NONE, numElements);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
         inQueueY_.FreeTensor(yInLocal);
 
         Add(yLocal, yLocal, yInLocalFP32, numElements);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::LocalTensor<Y_T> yOutLocal = outQueueY_.AllocTensor<Y_T>();
         Cast(yOutLocal, yLocal, AscendC::RoundMode::CAST_RINT, numElements);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
 
         outQueueY_.EnQue<Y_T>(yOutLocal);
     }
@@ -257,40 +249,40 @@ private:
         AscendC::LocalTensor<float> wTmpTensor = tmpBufferW_.Get<float>();
 
         Cast(wTmpTensor, wLocal, AscendC::RoundMode::CAST_NONE, MASK_COUNT, blockReduceRepeatCount, castParams_);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
         inQueueW_.FreeTensor(wLocal);
 
         Mul(wTmpTensor, xDup, wTmpTensor, MASK_COUNT, blockReduceRepeatCount, dotProductParams_);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
 
         if (maxLoRARank_ == LORA_RANK_8) {
             BlockReduceSum(yLocal[progress], wTmpTensor, blockReduceRepeatCount, MASK_COUNT,
                            reduceSumParams_.dstRepStride, reduceSumParams_.srcBlkStride, reduceSumParams_.srcRepStride);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
         } else if (maxLoRARank_ == LORA_RANK_16) {
             BlockReduceSum(wTmpTensor, wTmpTensor, blockReduceRepeatCount, MASK_COUNT, reduceSumParams_.dstRepStride,
                            reduceSumParams_.srcBlkStride, reduceSumParams_.srcRepStride);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             PairReduceSum(yLocal[progress], wTmpTensor, pairReduceRepeat16, MASK_COUNT, reduceSumParams_.dstRepStride,
                           reduceSumParams_.srcBlkStride, reduceSumParams_.srcRepStride);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
         } else if (maxLoRARank_ == LORA_RANK_32) {
             BlockReduceSum(wTmpTensor, wTmpTensor, blockReduceRepeatCount, MASK_COUNT, reduceSumParams_.dstRepStride,
                            reduceSumParams_.srcBlkStride, reduceSumParams_.srcRepStride);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             PairReduceSum(wTmpTensor, wTmpTensor, pairReduceRepeat16, MASK_COUNT, reduceSumParams_.dstRepStride,
                           reduceSumParams_.srcBlkStride, reduceSumParams_.srcRepStride);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             PairReduceSum(yLocal[progress], wTmpTensor, pairReduceRepeat32, MASK_COUNT, reduceSumParams_.dstRepStride,
                           reduceSumParams_.srcBlkStride, reduceSumParams_.srcRepStride);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
         } else if (maxLoRARank_ == LORA_RANK_64) {
             BlockReduceSum(wTmpTensor, wTmpTensor, blockReduceRepeatCount, MASK_COUNT, reduceSumParams_.dstRepStride,
                            reduceSumParams_.srcBlkStride, reduceSumParams_.srcRepStride);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             BlockReduceSum(yLocal[progress], wTmpTensor, pairReduceRepeat16, MASK_COUNT, reduceSumParams_.dstRepStride,
                            reduceSumParams_.srcBlkStride, reduceSumParams_.srcRepStride);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 

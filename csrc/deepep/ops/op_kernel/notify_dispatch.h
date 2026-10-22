@@ -6,18 +6,11 @@
 
 #include "comm_args.h"
 #include "data_copy.h"
-#include "moe_distribute_base.h"
+#include "moe_distribute_v2_base.h"
 
 using namespace AscendC;
 using namespace Moe;
-
-template <AscendC::HardEvent event>
-__aicore__ inline void SyncFunc()
-{
-    int32_t eventID = static_cast<int32_t>(GetTPipePtr()->FetchEventID(event));
-    AscendC::SetFlag<event>(eventID);
-    AscendC::WaitFlag<event>(eventID);
-}
+using namespace MoeDistributeV2Base;
 
 #define KERNELS_ARGS_FUN_ALL2ALL()                                                                                  \
     GM_ADDR sendDataInput, GM_ADDR tokenPerExpertDataInput, GM_ADDR sendDataOffsetOutput, GM_ADDR recvDataOutput,   \
@@ -51,7 +44,7 @@ class NotifyDispatch
     // Synchronization flag occupies length
     constexpr static int64_t FLAG_UNIT_INT_NUM = 4;
     constexpr static int64_t MAGIC_MASK = ~((1LL << 32) - 1);
-    constexpr static int32_t EXPERT_NORMAL_NUM = 256;
+    constexpr static int32_t EXPERT_NORMAL_NUM = 512;
     constexpr static int32_t BATCH_ROUND = 16;
 
 public:
@@ -72,7 +65,19 @@ public:
         recvOffset_ = recvOffset;
         maxBs_ = maxBs;
         recvTokensPerExpert_ = recvTokensPerExpert;
-        batchRounds = numExperts > EXPERT_NORMAL_NUM ? BATCH_ROUND : BATCH_ROUND * 2;
+        if (round == 1) {
+            batchRounds = 1;  // 没有开蚂蚁搬家，不需要多轮处理, 避免UB分配过大
+        } else {
+            if (numLocalExperts >= (EXPERT_NORMAL_NUM / 4)) {
+                batchRounds = BATCH_ROUND;
+            } else if (numExperts > EXPERT_NORMAL_NUM) {  // >512
+                batchRounds = BATCH_ROUND / 2;
+            } else if (numExperts <= EXPERT_NORMAL_NUM / 2) {  // <=256
+                batchRounds = BATCH_ROUND * 2;
+            } else {  // 256< exp <= 512
+                batchRounds = BATCH_ROUND;
+            }
+        }
         tokenPerExpertDataAlignLen = Ceil(batchRounds * numExperts * sizeof(int32_t), UB_ALIGN_SIZE) * UB_ALIGN_SIZE;
         sendDataOffsetAlignLen = Ceil(batchRounds * numExperts * sizeof(T), UB_ALIGN_SIZE) * UB_ALIGN_SIZE;
         sendDataAlignLen = Ceil(batchRounds * numExperts * sendPerGroup * sizeof(T), UB_ALIGN_SIZE) * UB_ALIGN_SIZE;
@@ -443,7 +448,7 @@ private:
         totalCntGt.SetGlobalBuffer((__gm__ int32_t *)totalRecvTokens_);
         DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(int32_t)), 0, 0, 0};
         DataCopyPad(totalCntGt, totalCntLt, copyParams);
-        SyncFunc<AscendC::HardEvent::MTE3_MTE2>();
+        SyncFunc<AscendC::HardEvent::MTE3_S>();
     }
 
     __aicore__ inline void BuildRecvCount()
@@ -524,6 +529,9 @@ private:
         if (blockIdx != MAX_BS_CORE) {
             return;
         }
+        pipe.InitBuffer(tmpBuf_, UB_ALIGN_SIZE);
+        LocalTensor<int32_t> maxBsLt = tmpBuf_.Get<int32_t>();
+
         uint32_t singleRankMaxElem = batchRounds * numLocalExperts * sendPerGroup;
         uint32_t singleRankMaxLen = singleRankMaxElem * sizeof(int32_t);
         uint32_t singleRankAlignLen = Ceil(singleRankMaxLen, UB_ALIGN_SIZE) * UB_ALIGN_SIZE;
@@ -567,10 +575,14 @@ private:
             uint32_t tempBs = sendTokensPerRankTensor(srcRank);
             maxBsNum = maxBsNum >= tempBs ? maxBsNum : tempBs;
         }
+        maxBsLt(0) = maxBsNum;
+        SyncFunc<AscendC::HardEvent::S_MTE3>();
+
         GlobalTensor<int32_t> maxBsGt;
         maxBsGt.SetGlobalBuffer((__gm__ int32_t *)maxBs_);
-        maxBsGt.SetValue(0, maxBsNum);
-        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(maxBsGt);
+        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(int32_t)), 0, 0, 0};
+        DataCopyPad(maxBsGt, maxBsLt, copyParams);
+        SyncFunc<AscendC::HardEvent::MTE3_S>();
     }
 
     __aicore__ inline void BuildRecvTokenPerExp()
@@ -684,7 +696,7 @@ private:
 
         pipe.InitBuffer(tmpBuf_, Ceil(numRanks * numLocalExperts * sizeof(int32_t), UB_ALIGN_SIZE) * UB_ALIGN_SIZE);
         LocalTensor<int32_t> expSrcTotalTensor = tmpBuf_.Get<int32_t>();
-        Duplicate<int32_t>(expSrcTotalTensor, 0, numExperts);
+        Duplicate<int32_t>(expSrcTotalTensor, 0, numRanks * numLocalExperts);
         SyncFunc<AscendC::HardEvent::V_S>();
 
         for (uint32_t rStart = 0; rStart < round; rStart += batchRounds) {

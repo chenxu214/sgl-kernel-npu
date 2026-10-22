@@ -1,7 +1,8 @@
 #include "aclnn_moe_distribute_combine_v2.h"
-#include "aclnnInner_moe_distribute_combine_v2.h"
+#include "aclnnInner_moe_low_latency_combine_v2.h"
 #include <algorithm>
 #include "graph/types.h"
+#include <cstring>
 
 #ifdef __cplusplus
 extern "C" {
@@ -10,10 +11,19 @@ extern "C" {
 enum NnopbaseHcclServerType {
     NNOPBASE_HCCL_SERVER_TYPE_AICPU = 0,
     NNOPBASE_HCCL_SERVER_TYPE_MTE,
+    NNOPBASE_HCCL_SERVER_TYPE_CCU,
     NNOPBASE_HCCL_SERVER_TYPE_END
 };
 
-extern aclnnStatus aclnnInnerMoeDistributeCombineV2GetWorkspaceSize(
+#ifndef ACLNN_SUCCESS
+#define ACLNN_SUCCESS 0
+#endif
+
+#ifndef ACLNN_ERR_INNER_NULLPTR
+#define ACLNN_ERR_INNER_NULLPTR (-1)
+#endif
+
+extern aclnnStatus aclnnInnerMoeLowLatencyCombineV2GetWorkspaceSize(
     const aclTensor *expandX, const aclTensor *expertIds, const aclTensor *assistInfoForCombine,
     const aclTensor *epSendCounts, const aclTensor *expertScales, const aclTensor *tpSendCounts,
     const aclTensor *xActiveMask, const aclTensor *activationScale, const aclTensor *weightScale,
@@ -23,14 +33,15 @@ extern aclnnStatus aclnnInnerMoeDistributeCombineV2GetWorkspaceSize(
     int64_t epRankId, int64_t moeExpertNum, char *groupTp, int64_t tpWorldSize, int64_t tpRankId,
     int64_t expertShardType, int64_t sharedExpertNum, int64_t sharedExpertRankNum, int64_t globalBs, int64_t outDtype,
     int64_t commQuantMode, int64_t groupListType, char *commAlg, int64_t zeroExpertNum, int64_t copyExpertNum,
-    int64_t constExpertNum, const aclTensor *x, uint64_t *workspaceSize, aclOpExecutor **executor);
+    int64_t constExpertNum, const aclTensor *x, const aclTensor *sendCostStats, uint64_t *workspaceSize,
+    aclOpExecutor **executor);
 
-extern aclnnStatus aclnnInnerMoeDistributeCombineV2(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+extern aclnnStatus aclnnInnerMoeLowLatencyCombineV2(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                     aclrtStream stream);
 
 extern "C" void __attribute__((weak)) NnopbaseSetHcclServerType(void *executor, NnopbaseHcclServerType sType);
 
-aclnnStatus aclnnMoeDistributeCombineV2GetWorkspaceSize(
+aclnnStatus aclnnMoeLowLatencyCombineV2GetWorkspaceSize(
     const aclTensor *expandX, const aclTensor *expertIds, const aclTensor *assistInfoForCombine,
     const aclTensor *epSendCounts, const aclTensor *expertScales, const aclTensor *tpSendCountsOptional,
     const aclTensor *xActiveMaskOptional, const aclTensor *activationScaleOptional,
@@ -38,24 +49,37 @@ aclnnStatus aclnnMoeDistributeCombineV2GetWorkspaceSize(
     const aclTensor *sharedExpertXOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
     int64_t sharedExpertRankNum, int64_t globalBs, int64_t outDtype, int64_t commQuantMode, int64_t groupListType,
-    char *commAlg, const aclTensor *xOut, uint64_t *workspaceSize, aclOpExecutor **executor)
+    char *commAlg, const aclTensor *xOut, const aclTensor *sendCostStats, uint64_t *workspaceSize,
+    aclOpExecutor **executor)
 {
-    return aclnnInnerMoeDistributeCombineV2GetWorkspaceSize(
+    aclnnStatus getWorkspaceSizesRes = aclnnInnerMoeLowLatencyCombineV2GetWorkspaceSize(
         expandX, expertIds, assistInfoForCombine, epSendCounts, expertScales, tpSendCountsOptional, xActiveMaskOptional,
         activationScaleOptional, weightScaleOptional, groupListOptional, expandScalesOptional, sharedExpertXOptional,
         nullptr, nullptr, nullptr, nullptr, nullptr, groupEp, epWorldSize, epRankId, moeExpertNum, groupTp, tpWorldSize,
         tpRankId, expertShardType, sharedExpertNum, sharedExpertRankNum, globalBs, outDtype, commQuantMode,
-        groupListType, commAlg, 0, 0, 0, xOut, workspaceSize, executor);
-}
+        groupListType, commAlg, 0, 0, 0, xOut, sendCostStats, workspaceSize, executor);
 
-aclnnStatus aclnnMoeDistributeCombineV2(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
-                                        aclrtStream stream)
-{
-    if (NnopbaseSetHcclServerType) {
-        NnopbaseSetHcclServerType(executor, NNOPBASE_HCCL_SERVER_TYPE_MTE);
+    if (getWorkspaceSizesRes != ACLNN_SUCCESS) {
+        return getWorkspaceSizesRes;
+    }
+    if (executor == nullptr || *executor == nullptr) {
+        return ACLNN_ERR_INNER_NULLPTR;
     }
 
-    return aclnnInnerMoeDistributeCombineV2(workspace, workspaceSize, executor, stream);
+    if (NnopbaseSetHcclServerType) {
+        if (commAlg != nullptr && std::strcmp(commAlg, "ccu") == 0) {
+            NnopbaseSetHcclServerType(*executor, NNOPBASE_HCCL_SERVER_TYPE_CCU);
+        } else {
+            NnopbaseSetHcclServerType(*executor, NNOPBASE_HCCL_SERVER_TYPE_MTE);
+        }
+    }
+    return getWorkspaceSizesRes;
+}
+
+aclnnStatus aclnnMoeLowLatencyCombineV2(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
+                                        aclrtStream stream)
+{
+    return aclnnInnerMoeLowLatencyCombineV2(workspace, workspaceSize, executor, stream);
 }
 
 #ifdef __cplusplus

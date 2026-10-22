@@ -40,11 +40,12 @@ repos:
       - id: codespell
         args:
           - -L
-          - cann,ND,tbe,CopyIn,EnQue,ot,ArchType,dout
+          - cann,ND,tbe,CopyIn,EnQue,ot,ArchType,dout,aLog,uSeed,useG,LoadIn
           - --ignore-regex
           - '\b(te|hel|ans|als|childs|vas|hsa|ment)\b'
           - --skip
           - '*.json,*.jsonl,*.patch,*.txt'
+          - --ignore-words-list=deviceC
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8
     hooks:

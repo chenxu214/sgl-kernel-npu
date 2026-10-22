@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 #define SGL_KERNEL_NPU_KERNEL_SGEMMV_SHRINK_H
 
 #include "kernel_operator.h"
+#include "lora_common_kernel.h"
 
 template <typename scalar_t>
 class SGEMMVShrink
@@ -37,13 +38,15 @@ public:
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR loraIndices, uint32_t loraIndicesSize,
                                 GM_ADDR seqLen, uint32_t seqLenSize, GM_ADDR loraRanks, uint32_t loraRanksSize,
                                 GM_ADDR loraScales, uint32_t loraScalesSize, GM_ADDR y, uint32_t batchSize,
-                                uint32_t numTokensPerCore, uint32_t inputHiddenDim, uint32_t maxLoRARank)
+                                uint32_t numTokensPerCore, uint32_t inputHiddenDim, uint32_t maxLoRARank,
+                                uint32_t slicesCount)
     {
         batchSize_ = batchSize;
         numTokensPerCore_ = numTokensPerCore;
         inputHiddenDim_ = inputHiddenDim;
         maxLoRARank_ = maxLoRARank;
-        singleLoRAWeightLen_ = inputHiddenDim_ * maxLoRARank_;
+        slicesCount_ = slicesCount;
+        singleLoRAWeightLen_ = inputHiddenDim_ * maxLoRARank_ * slicesCount_;
         incremental_ = inputHiddenDim_ > TILE_LENGTH;
 
         xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ X_T *>(x));
@@ -65,20 +68,29 @@ public:
 
     __aicore__ inline void Process()
     {
-        int64_t blockIdx = AscendC::GetBlockIdx();
+        int64_t blockIdx_Slice = AscendC::GetBlockIdx();
+        int64_t blockIdx = blockIdx_Slice / slicesCount_;
         int64_t startIdx = blockIdx * numTokensPerCore_;
         int64_t endIdx = startIdx + numTokensPerCore_;
+        reqSlice_ = blockIdx_Slice % slicesCount_;
+
         if (endIdx > batchSize_) {
             endIdx = batchSize_;
         }
+        int64_t requestBlock = 0;
+        lora_common::BlockIterator blockIterator(seqLenGm_);
         for (int64_t idx = startIdx; idx < endIdx; idx++) {
             // set up LoRA index
-            CopyInIndex(idx);
+            requestBlock = blockIterator.GetBlockIdx(idx);
+            if (requestBlock < 0) {
+                continue;
+            }
+
+            reqLoRAIndex_ = loraIndicesGm_.GetValue(requestBlock);
             if (reqLoRAIndex_ < 0) {
                 continue;
             }
 
-            reqLoRAWeightOffset_ = reqLoRAIndex_ * singleLoRAWeightLen_;
             reqLoRARank_ = loraRanksGm_.GetValue(reqLoRAIndex_);
 
             if (reqLoRARank_ == 0) {
@@ -86,6 +98,7 @@ public:
             }
 
             reqLoRAScale_ = loraScalesGm_.GetValue(reqLoRAIndex_);
+            reqLoRAWeightOffset_ = reqLoRAIndex_ * singleLoRAWeightLen_ + reqSlice_ * reqLoRARank_ * inputHiddenDim_;
 
             if (incremental_) {
                 ProcessImpl<true>(idx);
@@ -108,7 +121,7 @@ private:
             AscendC::LocalTensor<float> xTmpTensor = tmpBufferX_.Get<float>();
             AscendC::LocalTensor<X_T> xLocal = inQueueX_.DeQue<X_T>();
             Cast(xTmpTensor, xLocal, AscendC::RoundMode::CAST_NONE, inputHiddenDim_);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             inQueueX_.FreeTensor(xLocal);
         }
 
@@ -124,22 +137,6 @@ private:
             CopyAndComputeLastIteration<INCREMENTAL_MODE>(idx, i, acc);
             yOutLocal.SetValue(i, acc);
         }
-    }
-
-    __aicore__ inline void CopyInIndex(const int64_t idx)
-    {
-        // look up the LoRA index
-        int64_t weightIdx = idx;
-        uint64_t i = 0;
-        for (; i < seqLenGm_.GetSize(); i++) {
-            int64_t repeatValue = seqLenGm_.GetValue(i);
-            if (weightIdx >= repeatValue) {
-                weightIdx -= repeatValue;
-                continue;
-            }
-            break;
-        }
-        reqLoRAIndex_ = (i < seqLenGm_.GetSize()) ? loraIndicesGm_.GetValue(i) : -1;
     }
 
     __aicore__ inline void CopyInX(const int64_t idx, int32_t colIdx, int32_t numElements = TILE_LENGTH)
@@ -167,20 +164,20 @@ private:
             AscendC::LocalTensor<X_T> xLocal = inQueueX_.DeQue<X_T>();
             Cast(xTmpTensor, xLocal, AscendC::RoundMode::CAST_NONE, numElements);
             Cast(wTmpTensor, wLocal, AscendC::RoundMode::CAST_NONE, numElements);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             inQueueX_.FreeTensor(xLocal);
             inQueueW_.FreeTensor(wLocal);
         } else {
             Cast(wTmpTensor, wLocal, AscendC::RoundMode::CAST_NONE, numElements);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             inQueueW_.FreeTensor(wLocal);
         }
         // dot product of the one tile of X and W
         Mul(wTmpTensor, xTmpTensor, wTmpTensor, numElements);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
         // reduce sum generate one number, which is the summation of all the dot product
         ReduceSum<float>(wTmpTensor, wTmpTensor, wTmpTensor, numElements);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
 
         acc += wTmpTensor.GetValue(0);
     }
@@ -206,7 +203,7 @@ private:
         AscendC::LocalTensor<Y_T> yOutLocal = outQueueY_.AllocTensor<Y_T>();
 
         Muls(yOutLocal, yLocal, reqLoRAScale_, reqLoRARank_);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
 
         outQueueY_.EnQue<Y_T>(yOutLocal);
     }
@@ -214,7 +211,7 @@ private:
     __aicore__ inline void CopyOut(const int64_t idx)
     {
         AscendC::LocalTensor<Y_T> yOutLocal = outQueueY_.DeQue<Y_T>();
-        DataCopy(yOutGm_[maxLoRARank_ * idx], yOutLocal, reqLoRARank_);
+        DataCopy(yOutGm_[slicesCount_ * maxLoRARank_ * idx + reqSlice_ * reqLoRARank_], yOutLocal, reqLoRARank_);
         outQueueY_.FreeTensor(yOutLocal);
     }
 
@@ -234,12 +231,14 @@ private:
     uint32_t numTokensPerCore_;
     uint32_t inputHiddenDim_;
     uint32_t maxLoRARank_;
+    uint32_t slicesCount_;
     uint32_t singleLoRAWeightLen_;
 
     uint64_t reqLoRAWeightOffset_;
     int32_t reqLoRAIndex_;
     int32_t reqLoRARank_;
     float reqLoRAScale_;
+    int32_t reqSlice_;
 
     bool incremental_;
 };
@@ -248,12 +247,13 @@ private:
     extern "C" __global__ __aicore__ void sgemmv_shrink_##TYPE(                                                        \
         GM_ADDR x, GM_ADDR weight, GM_ADDR loraIndices, uint32_t loraIndicesSize, GM_ADDR seqLen, uint32_t seqLenSize, \
         GM_ADDR loraRanks, uint32_t loraRanksSize, GM_ADDR loraScales, uint32_t loraScalesSize, GM_ADDR y,             \
-        uint32_t batchSize, uint32_t numTokensPerCore, uint32_t inputHiddenDim, uint32_t maxLoRARank)                  \
+        uint32_t batchSize, uint32_t numTokensPerCore, uint32_t inputHiddenDim, uint32_t maxLoRARank,                  \
+        uint32_t slicesCount)                                                                                          \
     {                                                                                                                  \
         AscendC::TPipe pipe;                                                                                           \
         SGEMMVShrink<TYPE> op(&pipe);                                                                                  \
         op.Init(x, weight, loraIndices, loraIndicesSize, seqLen, seqLenSize, loraRanks, loraRanksSize, loraScales,     \
-                loraScalesSize, y, batchSize, numTokensPerCore, inputHiddenDim, maxLoRARank);                          \
+                loraScalesSize, y, batchSize, numTokensPerCore, inputHiddenDim, maxLoRARank, slicesCount);             \
         op.Process();                                                                                                  \
     }
 

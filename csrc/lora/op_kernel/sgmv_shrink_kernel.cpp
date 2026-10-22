@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 #define SGL_KERNEL_NPU_KERNEL_SGMV_SHRINK_H
 
 #include "kernel_operator.h"
+#include "lora_common_kernel.h"
 
 template <typename scalar_t>
 class SGMVShrink
@@ -69,9 +70,17 @@ public:
         if (endIdx > batchSize_) {
             endIdx = batchSize_;
         }
+
+        int64_t requestBlock = 0;
+        lora_common::BlockIterator blockIterator(seqLenGm_);
         for (int64_t idx = startIdx; idx < endIdx; idx++) {
             // set up LoRA index
-            CopyInIndex(idx);
+            requestBlock = blockIterator.GetBlockIdx(idx);
+            if (requestBlock < 0) {
+                continue;
+            }
+
+            reqLoRAIndex_ = loraIndicesGm_.GetValue(requestBlock);
             if (reqLoRAIndex_ < 0) {
                 continue;
             }
@@ -98,7 +107,7 @@ private:
             AscendC::LocalTensor<float> xTmpTensor = tmpBufferX_.Get<float>();
             AscendC::LocalTensor<X_T> xLocal = inQueueX_.DeQue<X_T>();
             Cast(xTmpTensor, xLocal, AscendC::RoundMode::CAST_NONE, inputHiddenDim_);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             inQueueX_.FreeTensor(xLocal);
         }
 
@@ -114,22 +123,6 @@ private:
             CopyAndComputeLastIteration<INCREMENTAL_MODE>(idx, i, acc);
             yOutLocal.SetValue(i, acc);
         }
-    }
-
-    __aicore__ inline void CopyInIndex(const int64_t idx)
-    {
-        // look up the LoRA index
-        int64_t weightIdx = idx;
-        uint64_t i = 0;
-        for (; i < seqLenGm_.GetSize(); i++) {
-            int64_t repeatValue = seqLenGm_.GetValue(i);
-            if (weightIdx >= repeatValue) {
-                weightIdx -= repeatValue;
-                continue;
-            }
-            break;
-        }
-        reqLoRAIndex_ = (i < seqLenGm_.GetSize()) ? loraIndicesGm_.GetValue(i) : -1;
     }
 
     __aicore__ inline void CopyInX(const int64_t idx, int32_t colIdx, int32_t numElements = TILE_LENGTH)
@@ -157,20 +150,20 @@ private:
             AscendC::LocalTensor<X_T> xLocal = inQueueX_.DeQue<X_T>();
             Cast(xTmpTensor, xLocal, AscendC::RoundMode::CAST_NONE, numElements);
             Cast(wTmpTensor, wLocal, AscendC::RoundMode::CAST_NONE, numElements);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             inQueueX_.FreeTensor(xLocal);
             inQueueW_.FreeTensor(wLocal);
         } else {
             Cast(wTmpTensor, wLocal, AscendC::RoundMode::CAST_NONE, numElements);
-            pipe_barrier(PIPE_V);
+            AscendC::PipeBarrier<PIPE_V>();
             inQueueW_.FreeTensor(wLocal);
         }
         // dot product of the one tile of X and W
         Mul(wTmpTensor, xTmpTensor, wTmpTensor, numElements);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
         // reduce sum generate one number, which is the summation of all the dot product
         ReduceSum<float>(wTmpTensor, wTmpTensor, wTmpTensor, numElements);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
 
         acc += wTmpTensor.GetValue(0);
     }
@@ -196,7 +189,7 @@ private:
         AscendC::LocalTensor<Y_T> yOutLocal = outQueueY_.AllocTensor<Y_T>();
 
         Muls(yOutLocal, yLocal, scale_, maxLoRARank_);
-        pipe_barrier(PIPE_V);
+        AscendC::PipeBarrier<PIPE_V>();
 
         outQueueY_.EnQue<Y_T>(yOutLocal);
     }

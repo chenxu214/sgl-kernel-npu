@@ -5,6 +5,7 @@
 #include <tuple>
 #include <vector>
 #include <optional>
+#include <string>
 #include "hccl/hccl.h"
 #include "hccl/hccl_types.h"
 #include "aclnn/opdev/platform.h"
@@ -27,11 +28,6 @@ struct Buffer {
     bool combine_enable_long_seq = false;  // Whether to enable the Combine Ant Migration feature
 
     bool low_latency_mode = false;
-    bool is_padding = false;
-    int padding_cnt = 0;
-    at::Tensor ori_x;
-    at::Tensor new_topk_idx;
-    at::Tensor new_scales;
     at::Tensor notify_send_data;  // only for internode notify
     at::Tensor send_token_idx_small;
     int notify_send_data_size;  // only for internode notify
@@ -77,7 +73,7 @@ public:
                        const std::optional<at::Tensor> &cached_channel_prefix_matrix,
                        const std::optional<at::Tensor> &dispatch_wait_recv_cost_stats, int expert_alignment,
                        int num_worst_tokens, const Config &config, std::optional<EventHandle> &previous_event,
-                       bool async, bool allocate_on_comm_stream, bool use_quant);
+                       bool async, bool allocate_on_comm_stream, bool use_quant, const std::string &quant_type);
 
     std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                at::Tensor>
@@ -119,19 +115,32 @@ public:
     low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
                          const std::optional<at::Tensor> &cumulative_local_expert_recv_stats,
                          int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, bool use_fp8, bool round_scale,
-                         bool use_ue8m0, bool async, bool return_recv_hook);
+                         bool use_ue8m0, bool use_mxfp4, bool async, bool return_recv_hook,
+                         const std::string &quant_mode_name);
 
     std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>> low_latency_combine(
         const at::Tensor &x, const at::Tensor &topk_idx, const at::Tensor &topk_weights, const at::Tensor &src_info,
         const at::Tensor &layout_range, int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
         const at::Tensor &packed_recv_count, bool zero_copy, bool async, bool return_recv_hook,
-        const std::optional<at::Tensor> &out);
+        const std::optional<at::Tensor> &out, bool use_mxfp8 = false);
 
     std::vector<at::Tensor> fused_deep_moe(const at::Tensor &x, const at::Tensor &expertIds,
                                            const at::Tensor &gmm1PermutedWeight,
                                            const at::Tensor &gmm1PermutedWeightScale, const at::Tensor &gmm2Weight,
                                            const at::Tensor &gmm2WeightScale, const at::Tensor &expertScalesOptional,
                                            int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
-                                           int quant_mode);
+                                           int quant_mode, bool profile_enable = false,
+                                           const std::optional<std::string> &activation = std::string("swiglu"),
+                                           std::optional<double> beta = 4.0, std::optional<double> linear_beta = 25.0);
+
+    void begin_profile(int64_t num_profile_skip_launches, int64_t num_profile_active_launches,
+                       const std::string &profile_trace_dir = "");
+    void end_profile();
+
+    std::vector<at::Tensor> dispatch_ffn_combine(const at::Tensor &x, const at::Tensor &expert_ids,
+                                                 const at::Tensor &weight1, const at::Tensor &scale1,
+                                                 const at::Tensor &weight2, const at::Tensor &scale2,
+                                                 const at::Tensor &expert_scales, int64_t max_output_size,
+                                                 int64_t num_experts, int quant_mode) const;
 };
 }  // namespace deep_ep

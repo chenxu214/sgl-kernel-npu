@@ -17,14 +17,7 @@
 #include "../op_kernel/dispatch_layout_tiling.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/hccl/hccl_tiling.h"
-
-#ifdef USE_CANN83_PATH
 #include "platform/platform_infos_def.h"
-#elif defined(USE_CANN82_PATH)
-#include "experiment/platform/platform/platform_infos_def.h"
-#else
-#error "CANN version not supported or platform_infos_def.h not found. Check CANN_VERSION_MACRO definition."
-#endif
 
 using namespace ge;
 namespace {
@@ -44,7 +37,7 @@ constexpr uint32_t ATTR_LOCAL_RANKSIZE_INDEX = 4;
 constexpr uint32_t ATTR_PER_ROUND_TOKENS_INDEX = 5;
 constexpr uint32_t ATTR_RANK_ID_INDEX = 6;
 const int64_t MAX_COMM_WORLD_SIZE = 384;
-const int64_t MAX_MOE_EXPERTS_NUM = 512;
+const int64_t MAX_MOE_EXPERTS_NUM = 1024;
 const int64_t MAX_LOCAL_RANKSIZE = 8;
 
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
@@ -133,12 +126,24 @@ static ge::graphStatus GetAttrAndSetTilingData(gert::TilingContext *context, con
             return ge::GRAPH_FAILED);
     }
 
+    OP_TILING_CHECK((*numTokensPtr < 0) || (*numTokensPtr > static_cast<int64_t>(UINT32_MAX)),
+                    OP_LOGE(nodeName, "numTokens is invalid, must be in [0, %ld], but got numTokens=%ld.",
+                            static_cast<int64_t>(UINT32_MAX), *numTokensPtr),
+                    return ge::GRAPH_FAILED);
     tilingData.dispatchLayoutInfo.numTokens = static_cast<uint32_t>(*numTokensPtr);
     tilingData.dispatchLayoutInfo.numRanks = static_cast<uint32_t>(*numRanksPtr);
     tilingData.dispatchLayoutInfo.numExperts = static_cast<uint32_t>(*numExpertsPtr);
     tilingData.dispatchLayoutInfo.numTopk = static_cast<uint32_t>(*numTopkPtr);
     tilingData.dispatchLayoutInfo.localRankSize = static_cast<uint32_t>(*localRankSizePtr);
+    OP_TILING_CHECK((*perRoundTokensPtr < 0) || (*perRoundTokensPtr > static_cast<int64_t>(UINT32_MAX)),
+                    OP_LOGE(nodeName, "perRoundTokens is invalid, must be in [0, %ld], but got perRoundTokens=%ld.",
+                            static_cast<int64_t>(UINT32_MAX), *perRoundTokensPtr),
+                    return ge::GRAPH_FAILED);
     tilingData.dispatchLayoutInfo.perRoundTokens = static_cast<uint32_t>(*perRoundTokensPtr);
+    OP_TILING_CHECK((*rankIdPtr < 0) || (*rankIdPtr > static_cast<int64_t>(UINT32_MAX)),
+                    OP_LOGE(nodeName, "rankId is invalid, must be in [0, %ld], but got rankId=%ld.",
+                            static_cast<int64_t>(UINT32_MAX), *rankIdPtr),
+                    return ge::GRAPH_FAILED);
     tilingData.dispatchLayoutInfo.rankId = static_cast<uint32_t>(*rankIdPtr);
 
     return ge::GRAPH_SUCCESS;
@@ -196,24 +201,35 @@ static bool CheckTensorDataType(gert::TilingContext *context, const char *nodeNa
     return true;
 }
 
-static bool CheckTensorShape(gert::TilingContext *context, const char *nodeName)
+static bool CheckTensorShape(gert::TilingContext *context, const char *nodeName,
+                             const DispatchLayoutTilingData &tilingData)
 {
     const gert::StorageShape *topkIdxStorageShape = context->GetInputShape(INPUT_TOPK_IDX_INDEX);
+    OP_TILING_CHECK(topkIdxStorageShape == nullptr, OP_LOGE(nodeName, "topkIdxStorageShape is null."), return false);
 
-    OP_TILING_CHECK((topkIdxStorageShape->GetStorageShape().GetDimNum() != TWO_DIMS),
-                    OP_LOGE(nodeName, "topkIdx must be 2-dimension, but get %lu dim.",
-                            topkIdxStorageShape->GetStorageShape().GetDimNum()),
+    const auto &topkIdxShape = topkIdxStorageShape->GetStorageShape();
+    OP_TILING_CHECK((topkIdxShape.GetDimNum() != TWO_DIMS),
+                    OP_LOGE(nodeName, "topkIdx must be 2-dimension, but get %lu dim.", topkIdxShape.GetDimNum()),
+                    return false);
+    OP_TILING_CHECK((topkIdxShape.GetDim(0) != tilingData.dispatchLayoutInfo.numTokens),
+                    OP_LOGE(nodeName, "topkIdx dim0 must equal numTokens, but got dim0=%ld, numTokens=%u.",
+                            topkIdxShape.GetDim(0), tilingData.dispatchLayoutInfo.numTokens),
+                    return false);
+    OP_TILING_CHECK((topkIdxShape.GetDim(1) != tilingData.dispatchLayoutInfo.numTopk),
+                    OP_LOGE(nodeName, "topkIdx dim1 must equal numTopk, but got dim1=%ld, numTopk=%u.",
+                            topkIdxShape.GetDim(1), tilingData.dispatchLayoutInfo.numTopk),
                     return false);
 
     return true;
 }
 
-static ge::graphStatus TilingCheckTensor(gert::TilingContext *context, const char *nodeName)
+static ge::graphStatus TilingCheckTensor(gert::TilingContext *context, const char *nodeName,
+                                         const DispatchLayoutTilingData &tilingData)
 {
     OP_TILING_CHECK(!CheckTensorDataType(context, nodeName), OP_LOGE(nodeName, "params dataType is invalid."),
                     return ge::GRAPH_FAILED);
 
-    OP_TILING_CHECK(!CheckTensorShape(context, nodeName), OP_LOGE(nodeName, "params dataType is invalid."),
+    OP_TILING_CHECK(!CheckTensorShape(context, nodeName, tilingData), OP_LOGE(nodeName, "params shape is invalid."),
                     return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
@@ -229,12 +245,14 @@ static ge::graphStatus DispatchLayoutTilingFuncImpl(gert::TilingContext *context
     OP_TILING_CHECK(GetAttrAndSetTilingData(context, nodeName, *tilingData) != ge::GRAPH_SUCCESS,
                     OP_LOGE(nodeName, "Get attr and set tiling data failed."), return ge::GRAPH_FAILED);
 
-    OP_TILING_CHECK(TilingCheckTensor(context, nodeName) != ge::GRAPH_SUCCESS,
+    OP_TILING_CHECK(TilingCheckTensor(context, nodeName, *tilingData) != ge::GRAPH_SUCCESS,
                     OP_LOGE(nodeName, "Tiling check param failed."), return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(SetWorkSpace(context, nodeName) != ge::GRAPH_SUCCESS,
                     OP_LOGE(nodeName, "Tiling set workspace failed."), return ge::GRAPH_FAILED);
 
+    // A3 and A5 share the generic multi-round DispatchLayout kernel.
+    // A2 uses its dedicated DispatchLayoutA2 kernel.
     int tilingKey = TILING_KEY_INT;
     if (CheckIfA2Machine(context)) {
         tilingKey = tilingKey + TILING_KEY_A2_TYPE;

@@ -1,19 +1,3 @@
-/**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 /*!
  * \file moe_distribute_dispatch_v2_tiling.cc
  * \brief
@@ -637,9 +621,12 @@ static ge::graphStatus CheckAttrs(gert::TilingContext *context, const char *node
 
     // 校验输入x的dim 0并设bs
     const gert::StorageShape *xStorageShape = context->GetInputShape(X_INDEX);
+    OP_TILING_CHECK(xStorageShape == nullptr, OP_LOGE(nodeName, "xStorageShape is nullptr."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(xStorageShape->GetStorageShape().GetDimNum() == 0, OP_LOGE(nodeName, "xStorageShape dimNum is 0."),
+                    return ge::GRAPH_FAILED);
     const int64_t xDim0 = xStorageShape->GetStorageShape().GetDim(0);
-    OP_TILING_CHECK((xDim0 > BS_UPPER_BOUND) || (xDim0 <= 0),
-                    OP_LOGE(nodeName, "xDim0(BS) is invalid. Should be between [1, %ld], but got xDim0=%ld.",
+    OP_TILING_CHECK((xDim0 > BS_UPPER_BOUND) || (xDim0 < 0),
+                    OP_LOGE(nodeName, "xDim0(BS) is invalid. Should be between [0, %ld], but got xDim0=%ld.",
                             BS_UPPER_BOUND, xDim0),
                     return ge::GRAPH_FAILED);
     tilingData.moeDistributeDispatchV2Info.bs = static_cast<uint32_t>(xDim0);
@@ -660,12 +647,6 @@ static ge::graphStatus CheckAttrs(gert::TilingContext *context, const char *node
                 "bs=%ld, epWorldSize=%u.",
                 *globalBsPtr, xDim0, epWorldSize),
         return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(((*globalBsPtr > (xDim0 * static_cast<int64_t>(epWorldSize))) && isActiveMask),
-                    OP_LOGE(nodeName,
-                            "Different bs on different rank cannot work when isActiveMask=true, globalBS=%ld, "
-                            "bs=%ld, epWorldSize=%u.",
-                            *globalBsPtr, xDim0, epWorldSize),
-                    return ge::GRAPH_FAILED);
     if (*globalBsPtr == 0) {
         tilingData.moeDistributeDispatchV2Info.globalBs = static_cast<uint32_t>(xDim0) * epWorldSize;
     } else {
@@ -704,7 +685,7 @@ static ge::graphStatus CheckTensorShape(const gert::TilingContext *context, cons
                             "xShape's dim0 is %ld, expertIdShape's dim0 is %ld.",
                             xDim0, expertIdsDim0),
                     return ge::GRAPH_FAILED);
-    OP_TILING_CHECK((expertIdsDim1 <= 0) || (expertIdsDim1 > K_MAX) || (expertIdsDim1 > moeExpertNum),
+    OP_TILING_CHECK((expertIdsDim1 < 0) || (expertIdsDim1 > K_MAX) || (expertIdsDim1 > moeExpertNum),
                     OP_LOGE(nodeName,
                             "expertIdShape's dim1(k) should be in (0, min(%ld, moeExpertNum=%ld)], "
                             "but got expertIdShape's dim1=%ld.",
@@ -836,7 +817,7 @@ static ge::graphStatus SetWorkSpace(gert::TilingContext *context, const char *no
     OP_TILING_CHECK(workSpaces == nullptr, OP_LOGE(nodeName, "workSpaces is nullptr."), return ge::GRAPH_FAILED);
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
-    workSpaces[0] = SYSTEM_NEED_WORKSPACE + static_cast<size_t>(WORKSPACE_ELEMENT_OFFSET * aivNum * aivNum);
+    workSpaces[0] = SYSTEM_NEED_WORKSPACE + static_cast<uint64_t>(WORKSPACE_ELEMENT_OFFSET) * aivNum * aivNum;
     return ge::GRAPH_SUCCESS;
 }
 
@@ -1139,14 +1120,23 @@ static ge::graphStatus MoeDistributeDispatchA2CheckShapeAndSetTiling(gert::Tilin
     auto attrs = context->GetAttrs();
     OP_TILING_CHECK(attrs == nullptr, OP_LOGE(K_INNER_DEBUG, "attrs is null."), return ge::GRAPH_FAILED);
     auto quantModePtr = attrs->GetAttrPointer<int>(ATTR_QUANT_MODE_INDEX);
+    OP_TILING_CHECK(quantModePtr == nullptr, OP_LOGE(K_INNER_DEBUG, "quantModePtr is null."), return GRAPH_FAILED);
     OP_TILING_CHECK(h % BLOCK_SIZE_A2 != 0 || h <= 0 || h > MAX_HIDDEN_SIZE_A2,
                     OP_LOGE(K_INNER_DEBUG, "hiddensize is invalid."), return GRAPH_FAILED);
-    OP_TILING_CHECK(bs <= 0 || bs > MAX_BATCH_SIZE_A2, OP_LOGE(K_INNER_DEBUG, "batchsize is invalid."),
+    OP_TILING_CHECK(bs < 0 || bs > MAX_BATCH_SIZE_A2, OP_LOGE(K_INNER_DEBUG, "batchsize is invalid."),
                     return GRAPH_FAILED);
     auto moeExpertNumPtr = attrs->GetAttrPointer<int>(ATTR_MOE_EXPERT_NUM_INDEX);
     auto zeroExpertNumPtr = attrs->GetAttrPointer<int64_t>(static_cast<int>(ATTR_ZERO_EXPERT_NUM_INDEX));
     auto copyExpertNumPtr = attrs->GetAttrPointer<int64_t>(static_cast<int>(ATTR_COPY_EXPERT_NUM_INDEX));
     auto constExpertNumPtr = attrs->GetAttrPointer<int64_t>(static_cast<int>(ATTR_CONST_EXPERT_NUM_INDEX));
+    OP_TILING_CHECK(moeExpertNumPtr == nullptr, OP_LOGE(K_INNER_DEBUG, "moeExpertNumPtr is null."),
+                    return GRAPH_FAILED);
+    OP_TILING_CHECK(zeroExpertNumPtr == nullptr, OP_LOGE(K_INNER_DEBUG, "zeroExpertNumPtr is null."),
+                    return GRAPH_FAILED);
+    OP_TILING_CHECK(copyExpertNumPtr == nullptr, OP_LOGE(K_INNER_DEBUG, "copyExpertNumPtr is null."),
+                    return GRAPH_FAILED);
+    OP_TILING_CHECK(constExpertNumPtr == nullptr, OP_LOGE(K_INNER_DEBUG, "constExpertNumPtr is null."),
+                    return GRAPH_FAILED);
     // 判断是否满足uint32_t及其他限制
     int32_t moeExpertNum = *moeExpertNumPtr;
     int32_t zeroExpertNum = static_cast<int32_t>(*zeroExpertNumPtr);
@@ -1260,7 +1250,9 @@ static uint64_t MoeDistributeDispatchA2CalcTilingKey(gert::TilingContext *contex
     }
 
     auto attrs = context->GetAttrs();
+    OP_TILING_CHECK(attrs == nullptr, OP_LOGE(K_INNER_DEBUG, "attrs is null."), return 0);
     auto quantModePtr = attrs->GetAttrPointer<int>(ATTR_QUANT_MODE_INDEX);
+    OP_TILING_CHECK(quantModePtr == nullptr, OP_LOGE(K_INNER_DEBUG, "quantModePtr is null."), return 0);
     tilingKey += static_cast<uint64_t>(*quantModePtr);
 
     const gert::StorageShape *scalesStorageShape = context->GetOptionalInputShape(SCALES_INDEX);
@@ -1331,7 +1323,11 @@ static ge::graphStatus MoeDistributeDispatchA2TilingFuncImpl(gert::TilingContext
 
     // 3. communication
     auto attrs = context->GetAttrs();
+    OP_TILING_CHECK(attrs == nullptr, VECTOR_INNER_ERR_REPORT_TILIING(nodeName, "attrs is nullptr."),
+                    return ge::GRAPH_FAILED);
     auto group = attrs->GetAttrPointer<char>(static_cast<int>(ATTR_GROUP_EP_INDEX));
+    OP_TILING_CHECK(group == nullptr, VECTOR_INNER_ERR_REPORT_TILIING(nodeName, "group is nullptr."),
+                    return ge::GRAPH_FAILED);
     std::string algConfig = isLayered ? "BatchWrite=level1:hierarchy" : "BatchWrite=level1:fullmesh";
     uint32_t opType = 18;  // BatchWrite
 
@@ -1366,7 +1362,7 @@ ge::graphStatus TilingParseForMoeDistributeDispatchV2(gert::TilingParseContext *
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(MoeDistributeDispatchV2)
+IMPL_OP_OPTILING(MoeLowLatencyDispatchV2)
     .Tiling(MoeDistributeDispatchV2TilingFunc)
     .TilingParse<MoeDistributeDispatchCompileInfo>(TilingParseForMoeDistributeDispatchV2);
 }  // namespace optiling
